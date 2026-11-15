@@ -7,6 +7,8 @@ add_library(vectorforge
     src/column_batch.cpp
     src/embedding_buffer.cpp
     src/batch_view.cpp
+    src/scalar_reference.cpp
+    src/batched_executor.cpp
 )
 add_library(VectorForge::vectorforge ALIAS vectorforge)
 target_include_directories(vectorforge PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -39,4 +41,24 @@ if(BUILD_TESTING)
         target_compile_options(vectorforge_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
     endif()
     add_test(NAME data_foundation COMMAND vectorforge_tests)
+
+    add_executable(vectorforge_scalar_tests tests/scalar_reference_test.cpp)
+    target_link_libraries(vectorforge_scalar_tests PRIVATE VectorForge::vectorforge)
+    set_target_properties(vectorforge_scalar_tests PROPERTIES CXX_EXTENSIONS OFF)
+    if(MSVC)
+        target_compile_options(vectorforge_scalar_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(vectorforge_scalar_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+    endif()
+    add_test(NAME scalar_reference COMMAND vectorforge_scalar_tests)
+
+    add_executable(vectorforge_batched_tests tests/batched_executor_test.cpp)
+    target_link_libraries(vectorforge_batched_tests PRIVATE VectorForge::vectorforge)
+    set_target_properties(vectorforge_batched_tests PROPERTIES CXX_EXTENSIONS OFF)
+    if(MSVC)
+        target_compile_options(vectorforge_batched_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(vectorforge_batched_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+    endif()
+    add_test(NAME batched_executor COMMAND vectorforge_batched_tests)
 endif()

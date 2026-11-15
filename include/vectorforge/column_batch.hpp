@@ -19,6 +19,8 @@ class ColumnBatch {
 public:
     using Column = std::variant<std::vector<std::int32_t>,
                                 std::vector<std::int64_t>, std::vector<float>>;
+    using ColumnView = std::variant<std::span<const std::int32_t>,
+                                    std::span<const std::int64_t>, std::span<const float>>;
 
     // Row count is inferred from the first column; no columns means zero rows.
     // Pass std::move(columns) to transfer existing allocations without copying.
@@ -31,6 +33,11 @@ public:
 
     [[nodiscard]] std::size_t row_count() const noexcept { return row_count_; }
     [[nodiscard]] std::size_t column_count() const noexcept { return columns_.size(); }
+
+    // Read-only type inspection without copying storage, e.g. for input validation.
+    // The returned spans borrow storage under the same contract as column<T>().
+    [[nodiscard]] ColumnView column_view(std::size_t index) const &;
+    ColumnView column_view(std::size_t) const && = delete;
 
     // Non-owning, read-only span. Index and stored type are checked.
     template <ColumnValue T>

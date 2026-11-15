@@ -20,4 +20,10 @@ ColumnBatch::ColumnBatch(std::vector<Column> columns)
 ColumnBatch::ColumnBatch(ColumnBatch&& other) noexcept
     : columns_(std::exchange(other.columns_, {})), row_count_(std::exchange(other.row_count_, 0)) {}
 
+ColumnBatch::ColumnView ColumnBatch::column_view(std::size_t index) const & {
+    return std::visit([]<typename T>(const std::vector<T>& values) -> ColumnView {
+        return std::span<const T>(values);
+    }, columns_.at(index));
+}
+
 } // namespace vectorforge
