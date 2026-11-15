@@ -92,7 +92,7 @@ struct Fixture {
 
 void check_known_query(const Fixture& f, std::span<const Predicate> predicates,
                        const std::vector<ScoredRecord>& all_expected) {
-    for (const auto k : std::array<std::size_t, 5>{0, 1, 3, 100, maximum_size}) {
+    for (const auto k : std::array<std::size_t, 7>{0, 1, 2, 3, 8, 100, maximum_size}) {
         auto expected = all_expected;
         expected.resize(std::min(k, expected.size()));
         exact_results(execute_scalar_reference(f.columns, f.embeddings, f.ids, f.query, predicates, k), expected);
@@ -159,7 +159,7 @@ void empty_and_single_row() {
     const ColumnBatch single({std::vector<float>{1}});
     const EmbeddingBuffer single_embedding(1, 2, {4, 3});
     const std::array<RecordID, 1> id{123};
-    for (const auto k : std::array<std::size_t, 3>{0, 1, 20}) {
+    for (const auto k : std::array<std::size_t, 4>{0, 1, 2, 20}) {
         compare_paths(no_columns, empty_embeddings, {}, query, {}, k);
         compare_paths(typed_empty, empty_embeddings, {}, query, predicate, k);
         compare_paths(single, single_embedding, id, query, predicate, k);
@@ -209,6 +209,87 @@ void cross_batch_ties() {
     const EmbeddingBuffer zeros(5, 1, {-std::numeric_limits<float>::denorm_min(), 0, -0.0F, 0, 0});
     const std::array half{0.5F};
     compare_paths(columns, zeros, ids, half, {}, 5);
+}
+
+void heap_root_replacement() {
+    const ColumnBatch columns({std::vector<std::int32_t>(7, 0)});
+    const EmbeddingBuffer embeddings(7, 1, {5, 1, 4, 2, 6, -1, 7});
+    const std::array<RecordID, 7> ids{50, 10, 40, 20, 60, 1, 70};
+    const std::array query{1.0F};
+    // The first heap [5,1] must reject 2 after accepting 4. Later arrivals 6 and
+    // 7 replace the worst retained entries. The final winner arrives last.
+    for (const auto size : batch_sizes) {
+        exact_results(execute_batched(columns, embeddings, ids, query, {}, 2, size), {{70, 7}, {60, 6}});
+    }
+    compare_paths(columns, embeddings, ids, query, {}, 1);
+    compare_paths(columns, embeddings, ids, query, {}, 2);
+
+    const ColumnBatch tie_columns({std::vector<std::int32_t>(8, 0)});
+    const EmbeddingBuffer ties(8, 1, {3, 3, 3, 3, 4, 3, 3, 2});
+    const std::array<RecordID, 8> tie_ids{80, 90, 70, 100, 60, 50, 20, 0};
+    // At equal scores, smaller IDs replace the root; larger IDs are discarded.
+    // Score takes precedence over ID, so the last candidate (ID 0, score 2) loses.
+    for (const auto size : batch_sizes) {
+        exact_results(execute_batched(tie_columns, ties, tie_ids, query, {}, 2, size), {{60, 4}, {20, 3}});
+        exact_results(execute_batched(tie_columns, ties, tie_ids, query, {}, 3, size), {{60, 4}, {20, 3}, {50, 3}});
+    }
+    compare_paths(tie_columns, ties, tie_ids, query, {}, 2);
+    compare_paths(tie_columns, ties, tie_ids, query, {}, 3);
+}
+
+void ordered_candidate_arrivals() {
+    const ColumnBatch columns({std::vector<std::int32_t>(9, 0)});
+    const EmbeddingBuffer ascending(9, 1, {-4, -3, -2, -1, 0, 1, 2, 3, 4});
+    const EmbeddingBuffer descending(9, 1, {4, 3, 2, 1, 0, -1, -2, -3, -4});
+    const std::array<RecordID, 9> ids{90, 80, 70, 60, 50, 40, 30, 20, 10};
+    const std::array query{1.0F};
+    for (const auto size : batch_sizes) {
+        exact_results(execute_batched(columns, ascending, ids, query, {}, 2, size), {{10, 4}, {20, 3}});
+        exact_results(execute_batched(columns, descending, ids, query, {}, 2, size), {{90, 4}, {80, 3}});
+    }
+    for (const auto k : std::array<std::size_t, 5>{1, 2, 9, 10, maximum_size}) {
+        compare_paths(columns, ascending, ids, query, {}, k);
+        compare_paths(columns, descending, ids, query, {}, k);
+    }
+}
+
+void bounded_candidate_storage() {
+    const std::array query{1.0F};
+    for (const auto k : std::array<std::size_t, 2>{1, 2}) {
+        std::size_t capacity_for_small_input = 0;
+        for (const auto rows : std::array<std::size_t, 2>{16, 4096}) {
+            std::vector<float> values;
+            std::vector<RecordID> ids;
+            for (std::size_t row = 0; row < rows; ++row) {
+                values.push_back(static_cast<float>(row));
+                ids.push_back(10'000 + static_cast<RecordID>(row));
+            }
+            const ColumnBatch columns({std::vector<std::int32_t>(rows, 0)});
+            const EmbeddingBuffer embeddings(rows, 1, std::move(values));
+            const auto result = execute_batched(columns, embeddings, ids, query, {}, k, 3);
+            std::vector<ScoredRecord> expected{{ids.back(), static_cast<float>(rows - 1)}};
+            if (k == 2) {
+                expected.push_back({ids[rows - 2], static_cast<float>(rows - 2)});
+            }
+            exact_results(result, expected);
+            // Observe the returned candidate vector's allocation, without imposing
+            // a particular standard library's vector growth factor or allocator.
+            if (rows == 16) {
+                capacity_for_small_input = result.capacity();
+            } else {
+                check(result.capacity() == capacity_for_small_input,
+                      "candidate capacity must not grow with qualifying row count for fixed K");
+            }
+            compare_paths(columns, embeddings, ids, query, {}, k);
+        }
+    }
+    const Fixture f;
+    const std::array one_match{Predicate{0, Comparison::equal, std::int32_t{7}}};
+    for (const auto size : batch_sizes) {
+        exact_results(execute_batched(f.columns, f.embeddings, f.ids, f.query, one_match, maximum_size, size),
+                      {{20, 8}});
+    }
+    compare_paths(f.columns, f.embeddings, f.ids, f.query, one_match, maximum_size);
 }
 
 void invalid_batch_size() {
@@ -354,7 +435,7 @@ void fixed_seed_randomized_differential() {
                 {1, ops[random() % ops.size()], base + 5}, {2, ops[random() % ops.size()], -0.5F}},
         };
         for (const auto& predicates : predicate_sets) {
-            for (const auto k : std::array<std::size_t, 4>{0, 1, rows / 2 + 1, rows + 5}) {
+            for (const auto k : std::array<std::size_t, 7>{0, 1, 2, rows / 2 + 1, rows, rows + 5, maximum_size}) {
                 compare_paths(columns, buffer, ids, query, predicates, k);
             }
         }
@@ -385,6 +466,9 @@ int main() {
         std::pair{"empty and single-row datasets", empty_and_single_row},
         std::pair{"all rows exactly once across batch boundaries", every_row_once},
         std::pair{"cross-batch ties and signed-zero score bits", cross_batch_ties},
+        std::pair{"heap-root replacement and deterministic tie-breaking", heap_root_replacement},
+        std::pair{"ascending and descending candidate arrivals", ordered_candidate_arrivals},
+        std::pair{"bounded candidate storage and huge K with one match", bounded_candidate_storage},
         std::pair{"zero batch size", invalid_batch_size},
         std::pair{"malformed inputs and predicate validation", malformed_inputs_and_predicates},
         std::pair{"non-finite inputs, even at K=0 or no matches", non_finite_inputs},

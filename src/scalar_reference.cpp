@@ -2,6 +2,7 @@
 
 #include "vectorforge/column_batch.hpp"
 #include "vectorforge/embedding_buffer.hpp"
+#include "vectorforge/validated_dataset.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -45,28 +46,14 @@ bool compare(T value, T constant, Comparison comparison) {
     throw std::invalid_argument("unsupported predicate comparison");
 }
 
-void validate_inputs(const ColumnBatch& columns, const EmbeddingBuffer& embeddings,
-                     std::span<const RecordID> record_ids, std::span<const float> query,
-                     std::span<const Predicate> predicates) {
-    const auto rows = columns.row_count();
-    if (rows != embeddings.row_count() || rows != record_ids.size()) {
-        throw std::invalid_argument("features, embeddings and Record IDs must have equal row counts");
-    }
+void validate_query_vector(const EmbeddingBuffer& embeddings, std::span<const float> query) {
     if (embeddings.dimension() == 0 || query.size() != embeddings.dimension()) {
         throw std::invalid_argument("query must match the positive embedding dimension");
     }
     require_finite(query);
+}
 
-    for (std::size_t index = 0; index < columns.column_count(); ++index) {
-        std::visit([rows](auto values) {
-            if (values.size() != rows) {
-                throw std::invalid_argument("numeric column length does not match row count");
-            }
-            if constexpr (std::same_as<typename decltype(values)::value_type, float>) {
-                require_finite(values);
-            }
-        }, columns.column_view(index));
-    }
+void validate_predicates(const ColumnBatch& columns, std::span<const Predicate> predicates) {
     for (const auto& predicate : predicates) {
         validate_comparison(predicate.comparison);
         std::visit([&]<typename T>(T constant) {
@@ -79,6 +66,28 @@ void validate_inputs(const ColumnBatch& columns, const EmbeddingBuffer& embeddin
             }
         }, predicate.constant);
     }
+}
+
+void validate_inputs(const ColumnBatch& columns, const EmbeddingBuffer& embeddings,
+                     std::span<const RecordID> record_ids, std::span<const float> query,
+                     std::span<const Predicate> predicates) {
+    const auto rows = columns.row_count();
+    if (rows != embeddings.row_count() || rows != record_ids.size()) {
+        throw std::invalid_argument("features, embeddings and Record IDs must have equal row counts");
+    }
+    validate_query_vector(embeddings, query);
+
+    for (std::size_t index = 0; index < columns.column_count(); ++index) {
+        std::visit([rows](auto values) {
+            if (values.size() != rows) {
+                throw std::invalid_argument("numeric column length does not match row count");
+            }
+            if constexpr (std::same_as<typename decltype(values)::value_type, float>) {
+                require_finite(values);
+            }
+        }, columns.column_view(index));
+    }
+    validate_predicates(columns, predicates);
 
     std::unordered_set<RecordID> seen;
     for (const auto id : record_ids) {
@@ -114,13 +123,10 @@ float dot_product(std::span<const float> query, std::span<const float> embedding
     return score;
 }
 
-} // namespace
-
-std::vector<ScoredRecord> execute_scalar_reference(
+std::vector<ScoredRecord> execute_query(
     const ColumnBatch& columns, const EmbeddingBuffer& embeddings,
     std::span<const RecordID> record_ids, std::span<const float> query,
     std::span<const Predicate> predicates, std::size_t k) {
-    validate_inputs(columns, embeddings, record_ids, query, predicates);
     std::vector<ScoredRecord> candidates;
     if (k == 0) {
         return candidates;
@@ -140,6 +146,26 @@ std::vector<ScoredRecord> execute_scalar_reference(
         candidates.resize(k);
     }
     return candidates;
+}
+
+} // namespace
+
+std::vector<ScoredRecord> execute_scalar_reference(
+    const ColumnBatch& columns, const EmbeddingBuffer& embeddings,
+    std::span<const RecordID> record_ids, std::span<const float> query,
+    std::span<const Predicate> predicates, std::size_t k) {
+    validate_inputs(columns, embeddings, record_ids, query, predicates);
+    return execute_query(columns, embeddings, record_ids, query, predicates, k);
+}
+
+std::vector<ScoredRecord> execute_scalar_reference(
+    const ValidatedDataset& dataset, std::span<const float> query,
+    std::span<const Predicate> predicates, std::size_t k) {
+    const auto& columns = dataset.columns();
+    const auto& embeddings = dataset.embeddings();
+    validate_query_vector(embeddings, query);
+    validate_predicates(columns, predicates);
+    return execute_query(columns, embeddings, dataset.record_ids(), query, predicates, k);
 }
 
 } // namespace vectorforge

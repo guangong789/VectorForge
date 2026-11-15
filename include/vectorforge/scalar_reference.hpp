@@ -9,6 +9,7 @@ namespace vectorforge {
 
 class ColumnBatch;
 class EmbeddingBuffer;
+class ValidatedDataset;
 
 // Synchronous scalar oracle: AND filters -> dot products -> full sort -> Top-K.
 // Inputs are borrowed only for the call; returned records own their values.
@@ -32,6 +33,14 @@ class EmbeddingBuffer;
 [[nodiscard]] std::vector<ScoredRecord> execute_scalar_reference(
     const ColumnBatch& columns, const EmbeddingBuffer& embeddings,
     std::span<const RecordID> record_ids, std::span<const float> query,
+    std::span<const Predicate> predicates, std::size_t k);
+
+// Trusted overload: stored data/ID invariants were established at admission.
+// Validates query dimensions/finiteness and every predicate, including at K=0;
+// does not copy dataset storage or rebuild the duplicate-ID set. The scalar
+// scoring/full-sort algorithm and computed-score validation remain unchanged.
+[[nodiscard]] std::vector<ScoredRecord> execute_scalar_reference(
+    const ValidatedDataset& dataset, std::span<const float> query,
     std::span<const Predicate> predicates, std::size_t k);
 
 } // namespace vectorforge
