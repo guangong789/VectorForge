@@ -7,7 +7,7 @@
 #include <cmath>
 #include <stdexcept>
 
-// Private implementation shared only by production Batched Top-K and COUNT.
+// Private implementation shared by production Batched Top-K, COUNT and SUM.
 // Inline to retain the original per-row optimisation/inlining opportunity.
 // The independent Scalar Reference must not include this helper.
 namespace vectorforge::detail {
@@ -36,11 +36,13 @@ inline void validate_predicates(const ColumnBatch& columns, std::span<const Pred
     }
 }
 
-// Precondition: predicates were all validated, and local < batch.row_count().
-inline bool matches_row(const BatchView& batch, std::size_t local, std::span<const Predicate> predicates) {
+// ColumnBatch uses global rows; BatchView uses local rows. Both provide the same
+// typed column access. Predicates must be validated and row < columns.row_count().
+template <typename Columns>
+inline bool matches_row(const Columns& columns, std::size_t row, std::span<const Predicate> predicates) {
     for (const auto& predicate : predicates) {
         const bool matches = std::visit([&]<typename T>(T constant) {
-            const T value = batch.column<T>(predicate.column_index)[local];
+            const T value = columns.template column<T>(predicate.column_index)[row];
             switch (predicate.comparison) {
             case Comparison::less:          return value < constant;
             case Comparison::less_equal:    return value <= constant;
