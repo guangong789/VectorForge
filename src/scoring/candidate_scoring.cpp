@@ -1,4 +1,5 @@
 #include "candidate_scoring.hpp"
+#include "candidate_scoring_simd.hpp"
 
 #include "numeric_contract.hpp"
 #include "vectorforge/embedding_buffer.hpp"
@@ -8,7 +9,7 @@
 
 namespace vectorforge::detail {
 
-std::size_t score_candidates(const EmbeddingBuffer& embeddings, std::span<const float> query,
+std::size_t score_candidates_scalar(const EmbeddingBuffer& embeddings, std::span<const float> query,
                              std::span<const std::size_t> global_rows, std::span<float> output) {
     if (global_rows.size() > candidate_window_capacity || output.size() != global_rows.size() ||
         query.size() != embeddings.dimension()) {

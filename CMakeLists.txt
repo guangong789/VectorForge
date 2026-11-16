@@ -6,6 +6,13 @@ option(VECTORFORGE_BUILD_BENCHMARKS "Build the standalone benchmark and its smok
 option(VECTORFORGE_SIMILARITY_DIAGNOSTICS "Save GCC reports and assembly for the benchmark-only similarity kernel" OFF)
 option(VECTORFORGE_BUILD_FMA_COMPARISON "Build isolated GCC/Clang x86-64 scalar FMA target comparisons" OFF)
 option(VECTORFORGE_BUILD_ACCUMULATOR_STUDY "Build the isolated four-accumulator numerical/performance study" OFF)
+option(VECTORFORGE_BUILD_CROSS_ROW_STUDY "Build the isolated AVX2/FMA gather feasibility prototype" OFF)
+option(VECTORFORGE_BUILD_AVX2_SCORING "Compile the private guarded AVX2 scoring candidate when supported" ON)
+option(VECTORFORGE_TEST_SIMD_DISPATCH "Legacy test marker only; cannot enable SIMD in production scoring" OFF)
+mark_as_advanced(VECTORFORGE_TEST_SIMD_DISPATCH)
+if(VECTORFORGE_BUILD_CROSS_ROW_STUDY AND NOT VECTORFORGE_BUILD_BENCHMARKS)
+    message(FATAL_ERROR "Cross-row study requires VECTORFORGE_BUILD_BENCHMARKS")
+endif()
 if(VECTORFORGE_BUILD_ACCUMULATOR_STUDY AND
    (NOT VECTORFORGE_BUILD_BENCHMARKS OR NOT VECTORFORGE_BUILD_FMA_COMPARISON))
     message(FATAL_ERROR "Accumulator study requires VECTORFORGE_BUILD_BENCHMARKS and VECTORFORGE_BUILD_FMA_COMPARISON")
@@ -48,6 +55,7 @@ add_library(vectorforge
     src/execution/scalar_reference.cpp
     src/execution/batched_executor.cpp
     src/scoring/candidate_scoring.cpp
+    src/scoring/candidate_dispatch.cpp
     src/data/validated_dataset.cpp
     src/execution/filtered_count.cpp
 )
@@ -73,7 +81,37 @@ if(VECTORFORGE_ENABLE_SANITIZERS)
     endif()
 endif()
 
+set(vectorforge_has_avx2_scoring OFF)
+if(VECTORFORGE_BUILD_AVX2_SCORING AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND
+   CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$" AND NOT MSVC)
+    set(vectorforge_has_avx2_scoring ON)
+    add_library(vectorforge_avx2_scoring OBJECT src/scoring/candidate_scoring_avx2.cpp)
+    target_include_directories(vectorforge_avx2_scoring PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_features(vectorforge_avx2_scoring PRIVATE cxx_std_20)
+    target_compile_options(vectorforge_avx2_scoring PRIVATE
+        -march=x86-64 -mtune=generic -mavx2 -mfma -fno-lto
+        -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+    set_target_properties(vectorforge_avx2_scoring PROPERTIES
+        CXX_EXTENSIONS OFF INTERPROCEDURAL_OPTIMIZATION FALSE POSITION_INDEPENDENT_CODE ON)
+    if(VECTORFORGE_ENABLE_SANITIZERS)
+        target_compile_options(vectorforge_avx2_scoring PRIVATE
+            -fsanitize=address,undefined -fno-omit-frame-pointer)
+    endif()
+    target_sources(vectorforge PRIVATE $<TARGET_OBJECTS:vectorforge_avx2_scoring>)
+endif()
+target_compile_definitions(vectorforge PRIVATE
+    VECTORFORGE_HAS_AVX2_SCORING=$<BOOL:${vectorforge_has_avx2_scoring}>)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$" AND NOT MSVC)
+    set_source_files_properties(src/scoring/candidate_dispatch.cpp PROPERTIES COMPILE_OPTIONS "-frounding-math;-fno-lto")
+endif()
+
 include(CTest)
+if(VECTORFORGE_TEST_SIMD_DISPATCH AND NOT BUILD_TESTING)
+    message(FATAL_ERROR "Legacy SIMD trial marker is restricted to BUILD_TESTING=ON validation builds")
+endif()
 if(BUILD_TESTING)
     add_executable(vectorforge_tests tests/data/data_foundation_test.cpp)
     target_link_libraries(vectorforge_tests PRIVATE VectorForge::vectorforge)
@@ -135,6 +173,58 @@ if(BUILD_TESTING)
         target_compile_options(vectorforge_candidate_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
     endif()
     add_test(NAME bounded_candidate_scoring COMMAND vectorforge_candidate_tests)
+
+    add_executable(vectorforge_simd_dispatch_tests tests/execution/simd_dispatch_test.cpp)
+    target_link_libraries(vectorforge_simd_dispatch_tests PRIVATE VectorForge::vectorforge)
+    target_include_directories(vectorforge_simd_dispatch_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_definitions(vectorforge_simd_dispatch_tests PRIVATE
+        VECTORFORGE_TEST_SIMD_DISPATCH=$<BOOL:${VECTORFORGE_TEST_SIMD_DISPATCH}>)
+    set_target_properties(vectorforge_simd_dispatch_tests PROPERTIES CXX_EXTENSIONS OFF)
+    if(MSVC)
+        target_compile_options(vectorforge_simd_dispatch_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(vectorforge_simd_dispatch_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+    endif()
+    add_test(NAME simd_dispatch_and_fp_gate COMMAND vectorforge_simd_dispatch_tests)
+
+    # Narrow Linux/ELF diagnostic only: no production dependency on libdl or
+    # provider inspection. Whole-static, cross and sanitizer builds do not claim
+    # LD_PRELOAD coverage; ordinary generic/static library builds remain valid.
+    set(vectorforge_provider_link_flags "${CMAKE_CXX_FLAGS} ${CMAKE_EXE_LINKER_FLAGS} ${CMAKE_SHARED_LINKER_FLAGS}")
+    foreach(provider_config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+        string(APPEND vectorforge_provider_link_flags
+            " ${CMAKE_CXX_FLAGS_${provider_config}} ${CMAKE_EXE_LINKER_FLAGS_${provider_config}} ${CMAKE_SHARED_LINKER_FLAGS_${provider_config}}")
+    endforeach()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_EXECUTABLE_FORMAT STREQUAL "ELF" AND
+       CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$" AND NOT CMAKE_CROSSCOMPILING AND
+       NOT VECTORFORGE_ENABLE_SANITIZERS AND NOT vectorforge_provider_link_flags MATCHES "(^|[ ,])-static(-pie)?($|[ ,])")
+        add_library(vectorforge_fmaf_errno_provider SHARED tests/execution/fmaf_errno_provider.cpp)
+        target_compile_features(vectorforge_fmaf_errno_provider PRIVATE cxx_std_20)
+        target_link_libraries(vectorforge_fmaf_errno_provider PRIVATE ${CMAKE_DL_LIBS})
+        set_target_properties(vectorforge_fmaf_errno_provider PROPERTIES
+            CXX_VISIBILITY_PRESET default VISIBILITY_INLINES_HIDDEN OFF)
+        add_library(vectorforge_provider_scalar_control OBJECT src/execution/batched_executor.cpp)
+        target_link_libraries(vectorforge_provider_scalar_control PRIVATE VectorForge::vectorforge)
+        target_include_directories(vectorforge_provider_scalar_control PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(vectorforge_provider_scalar_control PRIVATE
+            execute_batched=execute_batched_scalar_control score_candidates=score_candidates_scalar)
+        add_executable(vectorforge_math_provider_tests tests/execution/math_provider_test.cpp
+            $<TARGET_OBJECTS:vectorforge_provider_scalar_control>)
+        target_link_libraries(vectorforge_math_provider_tests PRIVATE VectorForge::vectorforge ${CMAKE_DL_LIBS})
+        target_include_directories(vectorforge_math_provider_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        add_dependencies(vectorforge_math_provider_tests vectorforge_fmaf_errno_provider)
+        foreach(provider_target vectorforge_fmaf_errno_provider vectorforge_provider_scalar_control vectorforge_math_provider_tests)
+            target_compile_options(${provider_target} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+            set_target_properties(${provider_target} PROPERTIES CXX_EXTENSIONS OFF INTERPROCEDURAL_OPTIMIZATION FALSE)
+        endforeach()
+        add_test(NAME scalar_provider_normal COMMAND ${CMAKE_COMMAND} -E env --unset=LD_PRELOAD
+            $<TARGET_FILE:vectorforge_math_provider_tests> --normal)
+        add_test(NAME scalar_provider_substitution COMMAND ${CMAKE_COMMAND} -E env
+            "LD_PRELOAD=$<TARGET_FILE:vectorforge_fmaf_errno_provider>" $<TARGET_FILE:vectorforge_math_provider_tests> --replacement)
+        set_tests_properties(scalar_provider_normal scalar_provider_substitution PROPERTIES SKIP_RETURN_CODE 77)
+    else()
+        message(STATUS "Provider-substitution regression omitted: requires native, unsanitized, dynamically linked Linux/ELF tests")
+    endif()
 endif()
 
 if(VECTORFORGE_BUILD_BENCHMARKS)
@@ -290,4 +380,75 @@ inline constexpr char fourway_options[] = R\"vf($<JOIN:$<TARGET_PROPERTY:vectorf
             target_compile_options(${benchmark_target} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
         endif()
     endforeach()
+
+    if(VECTORFORGE_BUILD_CROSS_ROW_STUDY)
+        if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" OR
+           NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$" OR MSVC)
+            message(FATAL_ERROR "Cross-row study requires GCC/Clang targeting x86-64")
+        endif()
+        foreach(variant scalar avx2)
+            add_library(vectorforge_cross_row_${variant} STATIC
+                benchmarks/similarity/cross_row_${variant}.cpp)
+            target_link_libraries(vectorforge_cross_row_${variant} PUBLIC VectorForge::vectorforge)
+            target_include_directories(vectorforge_cross_row_${variant} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+            target_compile_options(vectorforge_cross_row_${variant} PRIVATE
+                -march=x86-64 -mtune=generic -mavx2 -mfma -fno-fast-math
+                -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+            set_target_properties(vectorforge_cross_row_${variant} PROPERTIES
+                INTERPROCEDURAL_OPTIMIZATION FALSE CXX_EXTENSIONS OFF)
+        endforeach()
+        target_link_libraries(vectorforge_cross_row_avx2 PRIVATE vectorforge_cross_row_scalar)
+        # Driver/CPU guard and test oracle compile for the ordinary generic target.
+        add_executable(vectorforge_cross_row_benchmark benchmarks/similarity/cross_row_main.cpp)
+        target_link_libraries(vectorforge_cross_row_benchmark PRIVATE
+            vectorforge_cross_row_scalar vectorforge_cross_row_avx2 vectorforge_benchmark_support)
+        target_include_directories(vectorforge_cross_row_benchmark PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_BINARY_DIR}/benchmark-info/$<CONFIG>")
+        file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/benchmark-info/$<CONFIG>/cross_row_build_info.hpp" CONTENT
+"#pragma once
+namespace vectorforge::benchmark::cross_row {
+inline constexpr char scalar_options[] = R\"vf($<JOIN:$<TARGET_PROPERTY:vectorforge_cross_row_scalar,COMPILE_OPTIONS>, >)vf\";
+inline constexpr char avx2_options[] = R\"vf($<JOIN:$<TARGET_PROPERTY:vectorforge_cross_row_avx2,COMPILE_OPTIONS>, >)vf\";
+}
+")
+        set(cross_row_drivers vectorforge_cross_row_benchmark)
+        if(BUILD_TESTING)
+            add_executable(vectorforge_cross_row_tests tests/benchmarks/cross_row_test.cpp)
+            target_link_libraries(vectorforge_cross_row_tests PRIVATE
+                vectorforge_cross_row_scalar vectorforge_cross_row_avx2)
+            target_include_directories(vectorforge_cross_row_tests PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+            list(APPEND cross_row_drivers vectorforge_cross_row_tests)
+            add_test(NAME cross_row_numerics_mapping_and_bounds COMMAND vectorforge_cross_row_tests)
+            add_test(NAME cross_row_smoke COMMAND vectorforge_cross_row_benchmark --smoke)
+            set_tests_properties(cross_row_numerics_mapping_and_bounds cross_row_smoke
+                PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+        foreach(driver IN LISTS cross_row_drivers)
+            target_compile_options(${driver} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+            set_target_properties(${driver} PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE CXX_EXTENSIONS OFF)
+        endforeach()
+
+        # V1-07C is study-only and reuses the existing study opt-in. No production
+        # dispatch/ISA configuration changes; no new production feature flag.
+        if(BUILD_TESTING AND vectorforge_has_avx2_scoring AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_library(vectorforge_fp_state_kernel STATIC benchmarks/similarity/fp_state_avx2.cpp)
+            target_link_libraries(vectorforge_fp_state_kernel PUBLIC VectorForge::vectorforge)
+            target_compile_options(vectorforge_fp_state_kernel PRIVATE -march=x86-64 -mtune=generic -mavx2 -mfma)
+            add_library(vectorforge_fp_state_support STATIC benchmarks/similarity/fp_state.cpp)
+            target_link_libraries(vectorforge_fp_state_support PUBLIC vectorforge_fp_state_kernel)
+            add_executable(vectorforge_fp_state_study benchmarks/similarity/fp_state_main.cpp)
+            target_link_libraries(vectorforge_fp_state_study PRIVATE vectorforge_fp_state_support ${CMAKE_DL_LIBS})
+            target_compile_definitions(vectorforge_fp_state_study PRIVATE
+                VECTORFORGE_FP_STUDY_CONFIG="$<CONFIG>" VECTORFORGE_FP_STUDY_SANITIZED=$<BOOL:${VECTORFORGE_ENABLE_SANITIZERS}>)
+            foreach(study_target vectorforge_fp_state_kernel vectorforge_fp_state_support vectorforge_fp_state_study)
+                target_include_directories(${study_target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+                target_compile_options(${study_target} PRIVATE -frounding-math -fno-lto
+                    -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+                set_target_properties(${study_target} PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE CXX_EXTENSIONS OFF)
+            endforeach()
+            add_test(NAME fp_state_isolation_and_replay COMMAND vectorforge_fp_state_study)
+            set_tests_properties(fp_state_isolation_and_replay PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+    endif()
 endif()
