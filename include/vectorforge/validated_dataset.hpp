@@ -29,7 +29,8 @@ class EmbeddingBuffer;
 // O(S), independent of original owners (which may then be released).
 // Trusted query validation: O(D + predicates) time, O(1) auxiliary memory; no
 // repeated dataset copy/ID set. Batched query candidate/output storage is
-// O(min(K,M)); scalar-reference candidates remain O(M), plus sort stack O(log M).
+// O(min(K,M)) plus a fixed scoring window; scalar-reference candidates remain
+// O(M), plus sort stack O(log M).
 // Legacy raw-input queries still use their O(N) temporary duplicate-ID set.
 // Existing E2E benchmarks continue to measure those legacy entry points.
 class ValidatedDataset {

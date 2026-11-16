@@ -1,5 +1,6 @@
 #include "vectorforge/scalar_reference.hpp"
 
+#include "numeric_contract.hpp"
 #include "vectorforge/column_batch.hpp"
 #include "vectorforge/embedding_buffer.hpp"
 #include "vectorforge/validated_dataset.hpp"

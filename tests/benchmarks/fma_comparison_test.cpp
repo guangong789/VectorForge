@@ -1,4 +1,4 @@
-#include "fma_comparison.hpp"
+#include "similarity/fma_comparison.hpp"
 
 #include "vectorforge/scalar_reference.hpp"
 

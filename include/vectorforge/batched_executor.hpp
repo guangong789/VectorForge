@@ -11,7 +11,7 @@ class ColumnBatch;
 class EmbeddingBuffer;
 class ValidatedDataset;
 
-// Independent batch scan -> AND filter -> scalar FMA -> global bounded-heap Top-K.
+// Independent batch scan -> AND filter -> bounded scoring -> global heap Top-K.
 // batch_size must be positive, including for empty input and K=0. Sizes exceeding
 // the dataset are valid. Only actual batch lengths advance the dataset offset.
 // Batch-local feature/embedding rows map to record_ids[batch.global_row(local)].
@@ -20,7 +20,11 @@ class ValidatedDataset;
 // Retained records are sorted in place into final output order after scanning.
 // Candidate storage grows with actual retained records, never preallocating K:
 // O(min(K, matches)) space, plus constant candidate temporaries for heap operations.
-// The same vector becomes the result; there is no hidden candidate collection.
+// The same vector becomes the result; no additional full-match array is retained.
+// A fixed internal window W=32 holds global row indices and scalar score outputs;
+// it flushes when full or at batch end, in scan order. It copies no embeddings.
+// Total scoring/candidate auxiliary storage is O(W + min(K,matches)), excluding
+// input validation. The window's indices/scores use 384 payload bytes on 64-bit hosts.
 // Input validation still uses an O(dataset rows) temporary set for duplicate IDs,
 // released before scanning. This is separate from the bounded candidate storage.
 //
@@ -46,7 +50,7 @@ class ValidatedDataset;
 
 // Trusted overload: immutable stored inputs were validated at dataset admission.
 // Only query/predicate/batch-size validation repeats (also at K=0); no O(N) ID set
-// or dataset copy occurs per query. Candidate/result storage is O(min(K,matches)),
+// or dataset copy occurs per query. Scoring/result storage is O(W+min(K,matches)),
 // with constant auxiliary validation/heap storage. FMA and ranking are unchanged.
 [[nodiscard]] std::vector<ScoredRecord> execute_batched(
     const ValidatedDataset& dataset, std::span<const float> query,

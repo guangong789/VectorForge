@@ -1,9 +1,12 @@
 #include "vectorforge/batched_executor.hpp"
 
+#include "scoring/candidate_scoring.hpp"
+#include "predicate_evaluation.hpp"
 #include "vectorforge/batch_view.hpp"
 #include "vectorforge/validated_dataset.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <unordered_set>
@@ -28,30 +31,6 @@ void validate_query_vector(const EmbeddingBuffer& embeddings, std::span<const fl
     validate_floats(query);
 }
 
-void validate_predicates(const ColumnBatch& columns, std::span<const Predicate> predicates) {
-    for (const auto& predicate : predicates) {
-        switch (predicate.comparison) {
-        case Comparison::less:
-        case Comparison::less_equal:
-        case Comparison::greater:
-        case Comparison::greater_equal:
-        case Comparison::equal:
-        case Comparison::not_equal:
-            break;
-        default:
-            throw std::invalid_argument("unsupported predicate comparison");
-        }
-        std::visit([&]<typename T>(T constant) {
-            (void)columns.column<T>(predicate.column_index);
-            if constexpr (std::same_as<T, float>) {
-                if (!std::isfinite(constant)) {
-                    throw std::invalid_argument("predicate constant must be finite");
-                }
-            }
-        }, predicate.constant);
-    }
-}
-
 void validate_inputs(const ColumnBatch& columns, const EmbeddingBuffer& embeddings,
                      std::span<const RecordID> ids, std::span<const float> query,
                      std::span<const Predicate> predicates) {
@@ -70,7 +49,7 @@ void validate_inputs(const ColumnBatch& columns, const EmbeddingBuffer& embeddin
             }
         }, columns.column_view(index));
     }
-    validate_predicates(columns, predicates);
+    detail::validate_predicates(columns, predicates);
 
     std::unordered_set<RecordID> seen;
     for (const auto id : ids) {
@@ -81,27 +60,6 @@ void validate_inputs(const ColumnBatch& columns, const EmbeddingBuffer& embeddin
     for (std::size_t row = 0; row < rows; ++row) {
         validate_floats(embeddings.row(row));
     }
-}
-
-bool matches_row(const BatchView& batch, std::size_t local, std::span<const Predicate> predicates) {
-    for (const auto& predicate : predicates) {
-        const bool matches = std::visit([&]<typename T>(T constant) {
-            const T value = batch.column<T>(predicate.column_index)[local];
-            switch (predicate.comparison) {
-            case Comparison::less:          return value < constant;
-            case Comparison::less_equal:    return value <= constant;
-            case Comparison::greater:       return value > constant;
-            case Comparison::greater_equal: return value >= constant;
-            case Comparison::equal:         return value == constant;
-            case Comparison::not_equal:     return value != constant;
-            }
-            throw std::invalid_argument("unsupported predicate comparison");
-        }, predicate.constant);
-        if (!matches) {
-            return false;
-        }
-    }
-    return true;
 }
 
 std::vector<ScoredRecord> execute_query(
@@ -115,21 +73,15 @@ std::vector<ScoredRecord> execute_query(
     const auto better = [](const ScoredRecord& a, const ScoredRecord& b) {
         return a.score > b.score || (a.score == b.score && a.id < b.id);
     };
-    for (std::size_t offset = 0; offset < columns.row_count();) {
-        const auto batch = make_batch(columns, embeddings, offset, batch_size);
-        for (std::size_t local = 0; local < batch.row_count(); ++local) {
-            if (!matches_row(batch, local, predicates)) {
-                continue;
-            }
-            const auto embedding = batch.embedding_row(local);
-            float score = 0.0F;
-            for (std::size_t feature = 0; feature < query.size(); ++feature) {
-                score = std::fma(query[feature], embedding[feature], score);
-                if (!std::isfinite(score)) {
-                    throw std::overflow_error("batched dot product produced a non-finite score");
-                }
-            }
-            const ScoredRecord candidate{record_ids[batch.global_row(local)], score};
+    std::array<std::size_t, detail::candidate_window_capacity> rows;
+    std::array<float, detail::candidate_window_capacity> scores;
+    std::size_t used = 0;
+    auto flush = [&] {
+        if (used == 0) { return; }
+        const auto completed = detail::score_candidates(embeddings, query, std::span(rows).first(used),
+                                                        std::span(scores).first(used));
+        for (std::size_t i = 0; i < completed; ++i) {
+            const ScoredRecord candidate{record_ids[rows[i]], scores[i]};
             // With "better" as the heap comparator, the root is the worst
             // retained candidate. Never grow beyond K, even during replacement.
             if (candidates.size() < k) {
@@ -141,6 +93,19 @@ std::vector<ScoredRecord> execute_query(
                 std::push_heap(candidates.begin(), candidates.end(), better);
             }
         }
+        if (completed != used) {
+            throw std::overflow_error("batched dot product produced a non-finite score");
+        }
+        used = 0;
+    };
+    for (std::size_t offset = 0; offset < columns.row_count();) {
+        const auto batch = make_batch(columns, embeddings, offset, batch_size);
+        for (std::size_t local = 0; local < batch.row_count(); ++local) {
+            if (!detail::matches_row(batch, local, predicates)) { continue; }
+            rows[used++] = batch.global_row(local);
+            if (used == rows.size()) { flush(); }
+        }
+        flush(); // Do not retain a partial window across batch boundaries.
         // make_batch bounds this sum by the dataset row count, even for SIZE_MAX
         // batch sizes. Advancing by batch_size instead could overflow or skip rows.
         offset += batch.row_count();
@@ -171,7 +136,7 @@ std::vector<ScoredRecord> execute_batched(
     const auto& columns = dataset.columns();
     const auto& embeddings = dataset.embeddings();
     validate_query_vector(embeddings, query);
-    validate_predicates(columns, predicates);
+    detail::validate_predicates(columns, predicates);
     return execute_query(columns, embeddings, dataset.record_ids(), query, predicates, k, batch_size);
 }
 

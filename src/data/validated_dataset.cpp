@@ -1,5 +1,6 @@
 #include "vectorforge/validated_dataset.hpp"
 
+#include "numeric_contract.hpp"
 #include "vectorforge/column_batch.hpp"
 #include "vectorforge/embedding_buffer.hpp"
 

@@ -1,5 +1,11 @@
 # Reproducible execution-path baseline
 
+Source navigation: this directory keeps the shared harness and E2E entry point at
+its root; `topk/`, `reuse/` and `similarity/` group the corresponding experiments.
+Production implementations live in `src/data/`, `src/execution/` and `src/scoring/`;
+public `vectorforge/*.hpp` include paths are unchanged. Archived measurements and
+source hashes retain the paths used when captured; commands below use the current layout.
+
 Build and run from the repository root (no additional dependencies):
 
 ```sh
@@ -229,11 +235,11 @@ cmake --build build-release -j 2
 # Custom shape/sampling (decimal seed); sampling flags alone retain the default matrix:
 ./build-release/vectorforge_similarity_benchmark --rows 4096 --dimension 128 \
   --warmup 2 --iterations 7 --seed 1447440437
-objdump -drwC build-release/CMakeFiles/vectorforge_similarity_kernel.dir/benchmarks/similarity_kernel.cpp.o \
+objdump -drwC build-release/CMakeFiles/vectorforge_similarity_kernel.dir/benchmarks/similarity/similarity_kernel.cpp.o \
   > build-release/similarity-kernel.asm
 ```
 
-The separate benchmark-only `similarity_kernel.cpp` contains the actual measured
+The separate benchmark-only [similarity_kernel.cpp](similarity/similarity_kernel.cpp) contains the actual measured
 kernel; production executors and ValidatedDataset are unchanged. Each call scans
 all N contiguous row-major embeddings with one fixed query, starting each row at
 positive zero and applying float32 `std::fma` in feature order. Every intermediate
@@ -262,7 +268,7 @@ or numerical relaxation is used; sorting continues to use the existing exact rul
 
 With the GCC-only diagnostics option, the **same compiled kernel** emits
 `build-release/similarity-vectorization-Release.txt` and
-`build-release/CMakeFiles/vectorforge_similarity_kernel.dir/benchmarks/similarity_kernel.cpp.s`.
+`build-release/CMakeFiles/vectorforge_similarity_kernel.dir/benchmarks/similarity/similarity_kernel.cpp.s`.
 The option only adds reports/save-temps to that target. Reports may append on
 recompilation; use a fresh build directory for a clean capture. See
 `compile_commands.json` for the exact command. To record GCC's effective ISA,
@@ -306,7 +312,7 @@ any hardware-target call, including metadata calls. An unsupported CPU exits 77
 without executing that target; CTest marks its two comparison tests skipped.
 `--help` remains available. No production ISA dispatch is introduced.
 
-Both static targets compile **the same** `similarity_kernel.cpp`, with private
+Both static targets compile **the same** [similarity_kernel.cpp](similarity/similarity_kernel.cpp), with private
 namespace definitions isolating their symbols from each other and from V1-01:
 
 | Target | Private code-generation options |
@@ -342,7 +348,7 @@ Old benchmark CSV schemas remain unchanged. Debug/sanitizer CTest uses tiny case
 
 With diagnostics enabled, the actual target objects save GCC reports at
 `build-release/fma-{generic,hardware}-vectorization-Release.txt` and assembly at
-`build-release/CMakeFiles/vectorforge_fma_{generic,hardware}_kernel.dir/benchmarks/similarity_kernel.cpp.s`.
+`build-release/CMakeFiles/vectorforge_fma_{generic,hardware}_kernel.dir/benchmarks/similarity/similarity_kernel.cpp.s`.
 Inspect each object's relocated disassembly with `objdump -drwC`; the linked
 executable also contains other functions, so a whole-binary `fmaf` search alone
 cannot characterize the hardware kernel.
@@ -363,3 +369,191 @@ gain at larger D is consistent with a sequential dependency bottleneck and lower
 relative call overhead, but no profiler attribution is claimed. Generic `fmaf`
 may itself use runtime-selected hardware; its implementation was not profiled.
 CSV, source/build context and raw evidence stay in ignored `build-release/`.
+
+## Four-accumulator study (V1-03)
+
+```sh
+cmake -S . -B build-study-release -DCMAKE_BUILD_TYPE=Release \
+  -DVECTORFORGE_BUILD_BENCHMARKS=ON -DVECTORFORGE_BUILD_FMA_COMPARISON=ON \
+  -DVECTORFORGE_BUILD_ACCUMULATOR_STUDY=ON -DVECTORFORGE_SIMILARITY_DIAGNOSTICS=ON \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake --build build-study-release -j 2
+ctest --test-dir build-study-release --output-on-failure
+./build-study-release/vectorforge_accumulator_benchmark > build-study-release/accumulator-baseline.csv
+./build-study-release/vectorforge_accumulator_benchmark --ranking > build-study-release/accumulator-ranking.csv
+./build-study-release/vectorforge_accumulator_benchmark --rows 4096 --dimension 129 \
+  --warmup 2 --iterations 8 --seed 1447440437
+```
+
+The opt-in experiment requires the existing benchmark/FMA comparison options,
+GCC/Clang x86-64, and runtime AVX/FMA support. The existing generic-compiled guard
+runs before any hardware-target calls; unsupported hosts exit 77 and CTest skips
+the study. Both primary kernels use identical code-generation settings:
+`-O3 -DNDEBUG -std=c++20 -march=x86-64 -mtune=generic -fno-fast-math -mavx -mno-avx2 -mfma`
+plus the existing warnings. Use empty global flags as in V1-02. Production code,
+its flags, ValidatedDataset and previous benchmarks remain unchanged.
+
+**Algorithm A** is the existing sequential hardware FMA kernel, unmodified.
+**Algorithm B** is [fourway_kernel.cpp](similarity/fourway_kernel.cpp): feature j updates accumulator j%4 with
+float32 `std::fma`, in ascending feature order within each lane. All four start
+at +0. Full groups process four features; the final 1/2/3 features update lanes
+0/1/2. The merge is explicitly `((a0+a1)+a2)+a3`, with float32 rounding after
+each addition. Each FMA and merge addition must remain finite. Inputs must be
+finite and not overlap the output, matching the sequential microkernel's
+preconditions; deterministic generation establishes finiteness before timing.
+Shape checks are inside both kernels. B changes accumulation order and is not
+numerically equivalent to A or a replacement for the production contract.
+
+Timing reuses V1-01's six N=1024/8192, D=32/128/768 shapes, fixed seed/generator,
+preallocated output and one resident row-major scan. Maximum embedding storage
+is 24 MiB. There are two warm-ups and eight measurements **per variant**. Each
+round runs both kernels and alternates first position; measured counts must be
+even and >=4, so both run first equally often. Timings include finite checks,
+output stores and B's merge; they exclude generation, allocations, correctness
+checks, numerical analysis, ranking, checksums and I/O. Each kernel's entire
+output must match its own precomputed score bits after every call. Cross-kernel
+differences are recorded, never treated as failed equivalence or hidden by a
+tolerance. Tests separately check B against an independent per-feature/lane
+oracle, tails 1–3, subnormals and repeated execution.
+
+The 37-column performance CSV contains the common timing/environment fields,
+both target ISA/options and per-variant checksums, plus the same pairwise metrics
+on both rows: compared count, equal-bit count/rate, maximum absolute difference,
+maximum relative difference, denominator floor, near-zero reference count and
+maximum ULP distance. Absolute differences use double subtraction of float32
+scores. Relative difference is `abs(A-B)/max(abs(A),1e-6)`; A is always sequential.
+The floor only affects reporting, never score generation or sorting. Values
+with `abs(A)<floor` are counted. ULP distance uses monotone binary32 keys and
+coalesces signed zeros; bitwise equality still distinguishes their signs. At
+N=0, per-dot latency and equality rate are blank. Non-finite scores are rejected,
+not dropped from the statistics. Default inputs are bounded 1/1024-grid values,
+which favor exact agreement; equality rates are specific to this distribution.
+
+`--ranking` alone produces a separate 32-column analysis CSV (no timing), including
+candidate IDs, both scores/score bits, ordered Top-K IDs, shared membership and
+pairwise error metrics. Four tiny fixtures cover: a one-ULP Top-1 membership
+change, full-set ordering changes with unchanged membership, exact-tie control,
+and fused cancellation near zero. Ranking always uses score descending then ID
+ascending, with no epsilon. In `close_top1`, sequential selects ID10 and four-way
+selects ID20. In `fused_cancellation`, sequential retains `-2^-46` while four-way
+rounds to +0, changing Top-1 from ID10 to ID5. The absolute difference is tiny
+despite a large ULP distance from zero; interpret ULP and relative metrics with
+their absolute differences. Finite samples do not establish ranking stability.
+
+Changed order can also change overflow behavior for finite inputs. Tests include
+a sequential-finite/lane-overflow case and a sequential-overflow/lane-finite case,
+plus merge overflow. These are legitimate consequences of the experiment; no
+claim of identical exceptional behavior or universal accuracy improvement is made.
+
+GCC diagnostics come from the actual compiled kernels:
+`build-study-release/fma-hardware-vectorization-Release.txt` and
+`build-study-release/fourway-vectorization-Release.txt`. Saved assembly is beside
+their objects under `CMakeFiles/vectorforge_fma_hardware_kernel.dir/benchmarks/similarity/`
+and `CMakeFiles/vectorforge_fourway_kernel.dir/benchmarks/similarity/`; inspect with
+`objdump -drwC`. GCC 13.4.0 reports zero vectorized loops in each. Assembly shows
+scalar `vfmadd231ss` with one chain for A and four distinct accumulator registers
+for B, followed by three scalar `vaddss` merge operations. Neither calls `fmaf`
+or has packed floating-point arithmetic/reduction. `vandps` is a bitwise finite
+check. No manual SIMD, vectorization-disabling flag or reassociated merge is used.
+
+Debug and ASan/UBSan/LSan builds use the same options plus Debug/sanitizer settings;
+CTest runs only tiny smoke/numerical/ranking cases. Use the established ordinary-user
+LSan path; never benchmark the full performance matrix under sanitizers. Raw
+results, exact compile commands and analysis stay in ignored build directories.
+This remains a single-threaded, unpinned warm-cache WSL2 experiment, not a universal
+speedup or accuracy claim. Root README and production numerical contracts are unchanged.
+
+## Bounded production candidate scoring (V1-06)
+
+The production Batched Executor now buffers at most **W=32 global row indices**
+and 32 score outputs. W is fixed independently of N/K/user batch size. These
+arrays use 384 payload bytes on a 64-bit host, plus fixed frame/view metadata;
+this is not a measured peak-RSS/total-stack claim. No embeddings are copied.
+Full windows and batch-end partial windows flush in scan order; windows never
+span batches. Empty windows do not call the scorer. The same global heap and
+final ordering remain, with O(W+min(K,M)) scoring/candidate storage; legacy
+validation's existing O(N) ID set and persistent dataset storage are separate.
+32 is a modest call-amortisation/storage choice, not a measured optimal width.
+
+[candidate_scoring.hpp](../src/scoring/candidate_scoring.hpp) / [.cpp](../src/scoring/candidate_scoring.cpp) is private, synchronous and generic-CPU scalar
+code, with no registry, ISA dispatch, SIMD, embedding packing or four-way
+accumulation. Each output slot corresponds to its input global row. The original
+dimension-order float32 FMA/positive-zero/per-step finite checks remain. On a
+nonfinite intermediate, the scorer stops and returns the completed finite prefix.
+The caller consumes earlier candidates before throwing the existing diagnostic,
+preserving the fused loop's earlier heap-allocation-failure precedence. Public
+queries never return partial results. Fault-injection tests cover both allocation
+before a later overflow and overflow before any candidate allocation. Validation,
+Scalar Reference, COUNT and dataset ownership are unchanged. This does not add
+guarantees about undocumented errno/floating-environment side-effect timing.
+
+### Comparison procedure and evidence
+
+The V1-04 fused implementation was built and tested **before editing** in
+`build-window-before`, and its executable/archive hashes were frozen. The proposed
+version was independently built in `build-window-after` with the same GCC 13.4.0,
+Release `-O3 -DNDEBUG`, C++20, warnings and generic x86-64 target, without fast-math.
+Both enable the existing benchmark/FMA/accumulator options; those ISA settings
+remain private to experiments. Do not rebuild the frozen directory with new sources.
+
+Use the existing reuse benchmark (its measured legacy/trusted query calls, not
+its modeled reuse totals), for example on each executable:
+
+```sh
+./build-window-before/vectorforge_reuse_benchmark --rows 8192 --dimension 128 \
+  --selectivity 100 --k 10 --batch-size 256 --reuse 1 \
+  --warmup 3 --iterations 10 --seed 1447440437
+# Repeat the identical arguments with ./build-window-after/vectorforge_reuse_benchmark
+```
+
+Nine explicit cases cover N=8192/D=32 or 128 and N=4096/D=768, each at 1%/100%
+selectivity, K=10/B=256; plus D=32 cases B=1/K=10/100%, B=7/K=1/10%, and
+B=32/K=N/100%. Each has six independent paired runs (ten samples per component
+per run), alternating first executable exactly three times each and rotating
+case order. Seeds and data/result fingerprints match. No CPU pinning, cache flush
+or sanitizer performance measurements. Raw samples retain outliers. The initial
+investigation threshold was >10% and >0.005 ms median slowdown; this was an
+investigation trigger, not a statistical confidence claim.
+
+Artifacts stay under ignored `build-release/window-analysis/`: `settings.json`,
+pre-edit snapshots/hashes, prechange CSVs, `paired/` raw CSVs, compile commands,
+`performance-summary.csv`, `paired-summary.json` and disassembly. The low-selectivity
+legacy cases were separately confirmed with six more paired runs, twenty samples
+per component, in `confirmation/` and `confirmation-summary.json`.
+
+### Local outcome: retain, with a legacy-path trade-off
+
+Primary trusted-path median paired after/before ratios were **0.456–0.913** across
+the nine cases. Representative 100%-selectivity query latencies (median of run
+medians, milliseconds) were:
+
+| D | Before | After |
+| --- | ---: | ---: |
+| 32 | 0.4083 | 0.3420 |
+| 128 | 1.9313 | 1.0021 |
+| 768 | 6.5897 | 3.0163 |
+
+This is not an all-path speedup: at 1% selectivity, legacy D=32 was about 6%
+slower; legacy D=128 was 12.6% slower initially and 7.4% in confirmation, whose
+paired ratios ranged 0.995–1.220. The exact material size of that regression is
+inconclusive on this unpinned WSL2 run. Its full validation/allocation costs remain
+part of the timed call; no cause is attributed without profiling. These raw
+observations are retained alongside the clear trusted/high-selectivity benefits.
+No speculative optimisation was added to rescue the boundary. The local decision
+is to **retain** it based on demonstrated primary-path benefits and bounded memory,
+while explicitly recording this legacy-path limitation; no universal speedup is claimed.
+
+Both old and new scoring loops still call scalar `fmaf`; neither gained hardware
+ISA instructions. Object assembly shows the old loop spilling/reloading its
+accumulator each feature while the separate scorer carries it in a register,
+consistent with the high-D gains, not a profiler-proven sole attribution.
+
+An independent C++ `new`/link-wrap probe ran 120 queries per version across
+N=128/16384, five batch sizes, dense/sparse/no matches, K=0/3 and both entry points.
+Results and allocation counts match exactly, with zero added allocations. It
+observed a maximum window of 32, one ordered submission per matching row, no
+empty/K=0 scoring calls and the expected full/batch-tail flush counts. Probe
+source/CSVs and `allocation-summary.json` are local artifacts, not production hooks.
+Debug/Release/ASan+UBSan+LSan pass 19/19; the focused scoring test adds 5,170 exact
+differential comparisons alongside existing tests. Production flags/ownership,
+COUNT and the independent reference remain unchanged; ISA experiments stay isolated.
