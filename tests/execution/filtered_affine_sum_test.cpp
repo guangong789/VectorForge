@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -93,7 +95,7 @@ std::int64_t oracle_add(std::int64_t total, std::int64_t value) {
 
 // Independent validation and row interpreter. No production validation, filter,
 // transform or checked-add operation is called here. Private helper includes above
-// are used ONLY by the separate validation-timing function at the end of this file.
+// are used ONLY by measurement controls, never by this correctness oracle.
 std::int64_t oracle(const ColumnBatch& columns, std::size_t source_column,
                     std::int32_t a, std::int32_t b,
                     std::span<const Predicate> predicates, std::size_t batch_size) {
@@ -430,13 +432,194 @@ void workload() {
         }
     }
 }
+
+// V1-11B: benchmark-local control, not a numeric COUNT API. Keep affine's
+// admission order and traversal, but omit source reads/transform/checked SUM.
+// Both this and production affine are out-of-line calls without LTO. Different
+// loop bodies may still produce different branches/instructions; their latency
+// difference is NOT an isolated arithmetic or pipeline-stage measurement.
+#if defined(__GNUC__)
+[[gnu::noinline]]
+#endif
+std::size_t filter_only_control(const ColumnBatch& columns, std::size_t source_column,
+                               std::span<const Predicate> predicates, std::size_t batch_size) {
+    if (batch_size == 0) { throw std::invalid_argument("batch size must be positive"); }
+    const auto rows = columns.row_count();
+    for (std::size_t column = 0; column < columns.column_count(); ++column) {
+        const auto view = columns.column_view(column);
+        detail::validate_column_length(view, rows);
+        detail::validate_column_floats(view, "affine SUM float columns must be finite");
+    }
+    (void)columns.column<std::int32_t>(source_column);
+    detail::validate_predicates(columns, predicates);
+    std::size_t count = 0;
+    for (std::size_t offset = 0; offset < rows;) {
+        const auto end = offset + std::min(batch_size, rows - offset);
+        for (std::size_t row = offset; row < end; ++row) {
+            if (detail::matches_row(columns, row, predicates)) { ++count; }
+        }
+        offset = end;
+    }
+    return count;
+}
+
+using LogicalRecord = std::array<std::int32_t, 3>; // source, match flag, float numerator / 8
+struct LayoutCase {
+    unsigned percent;
+    std::string_view layout;
+    ColumnBatch columns;
+    std::int64_t sum;
+    std::uint64_t fingerprint;
+};
+constexpr std::size_t layout_rows = 1'000'000, layout_batch = 1024;
+constexpr std::int32_t layout_a = -7, layout_b = 13;
+constexpr std::uint64_t layout_seed = 0x56463111BULL;
+const std::array layout_predicates{Predicate{1, Comparison::equal, std::int32_t{1}}};
+
+ColumnBatch layout_columns(const std::vector<LogicalRecord>& records) {
+    std::vector<std::int32_t> x(records.size()), flags(records.size());
+    std::vector<float> real(records.size());
+    for (std::size_t row = 0; row < records.size(); ++row) {
+        x[row] = records[row][0]; flags[row] = records[row][1];
+        real[row] = static_cast<float>(records[row][2]) / 8.0F;
+    }
+    std::vector<ColumnBatch::Column> columns;
+    columns.reserve(3);
+    columns.emplace_back(std::move(x)); columns.emplace_back(std::move(flags));
+    columns.emplace_back(std::move(real));
+    return ColumnBatch(std::move(columns));
+}
+
+// Exact multiset comparison is generation/gating work only, never a query path.
+std::vector<LogicalRecord> selected_records(const ColumnBatch& columns) {
+    const auto x = columns.column<std::int32_t>(0), flags = columns.column<std::int32_t>(1);
+    const auto real = columns.column<float>(2);
+    std::vector<LogicalRecord> selected;
+    for (std::size_t row = 0; row < columns.row_count(); ++row) {
+        if (flags[row] == 1) {
+            selected.push_back({x[row], flags[row], static_cast<std::int32_t>(real[row] * 8.0F)});
+        }
+    }
+    std::sort(selected.begin(), selected.end());
+    return selected;
+}
+
+std::uint64_t layout_fingerprint(const ColumnBatch& columns) {
+    std::uint64_t hash = 14'695'981'039'346'656'037ULL;
+    auto mix = [&](std::uint32_t word) { hash = (hash ^ word) * 1'099'511'628'211ULL; };
+    for (const auto value : columns.column<std::int32_t>(0)) { mix(static_cast<std::uint32_t>(value)); }
+    for (const auto value : columns.column<std::int32_t>(1)) { mix(static_cast<std::uint32_t>(value)); }
+    for (const auto value : columns.column<float>(2)) { mix(std::bit_cast<std::uint32_t>(value)); }
+    return hash;
+}
+
+std::int64_t layout_query(const LayoutCase& data, std::size_t path) {
+    // Compiler memory barrier for both paths: repeated read-only control calls
+    // must not be hoisted/coalesced. Not a CPU fence or a timed payload copy.
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    if (path == 0) { return sum_affine_where(data.columns, 0, layout_a, layout_b, layout_predicates, layout_batch); }
+    if (path == 1) { return static_cast<std::int64_t>(filter_only_control(data.columns, 0, layout_predicates, layout_batch)); }
+    return validation_only(data.columns, layout_predicates);
+}
+
+void layout_study(bool timing, unsigned run) {
+    std::vector<LayoutCase> cases;
+    cases.reserve(4);
+    for (const unsigned percent : {1U, 90U}) {
+        std::mt19937_64 random(layout_seed);
+        std::vector<LogicalRecord> records(layout_rows);
+        const auto matches = layout_rows / 100 * percent;
+        for (std::size_t row = 0; row < layout_rows; ++row) {
+            records[row] = {static_cast<std::int32_t>(random() % 2001) - 1000,
+                row < matches ? 1 : 0, static_cast<std::int32_t>(row % 17)};
+        }
+        std::mt19937_64 permutation(layout_seed ^ 0x9E3779B97F4A7C15ULL);
+        for (std::size_t remaining = records.size(); remaining > 1; --remaining) {
+            std::swap(records[remaining - 1], records[static_cast<std::size_t>(permutation() % remaining)]);
+        }
+        cases.push_back({percent, "random", layout_columns(records), 0, 0});
+        std::stable_partition(records.begin(), records.end(), [](const auto& row) { return row[1] == 1; });
+        cases.push_back({percent, "clustered", layout_columns(records), 0, 0});
+        const auto selected = selected_records(cases[cases.size() - 2].columns);
+        check(selected.size() == matches && selected == selected_records(cases.back().columns), "selected-record multisets differ");
+    }
+    // |y| <= 7013, so EVERY prefix is bounded by 7,013,000,000 even under
+    // permutation. The independent interpreter additionally checks each prefix.
+    check(std::int64_t{7013} * static_cast<std::int64_t>(layout_rows) < high64, "prefix bound");
+    for (auto& data : cases) {
+        data.sum = oracle(data.columns, 0, layout_a, layout_b, layout_predicates, layout_batch);
+        const auto count = oracle(data.columns, 0, 0, 1, layout_predicates, layout_batch);
+        check(count == static_cast<std::int64_t>(layout_rows / 100 * data.percent), "independent selected count");
+        data.fingerprint = layout_fingerprint(data.columns);
+        for (std::size_t path = 0; path < 3; ++path) {
+            const auto expected = path == 0 ? data.sum : path == 1 ? count : static_cast<std::int64_t>(layout_rows);
+            const Probe probe;
+            check(layout_query(data, path) == expected, "layout correctness gate");
+            check(allocations::calls == 0, "layout gate query allocated");
+        }
+        std::cerr << "gate," << data.percent << ',' << data.layout << ",count=" << count << ",sum=" << data.sum
+                  << ",prefix_abs_bound=7013000000,allocations=0,fingerprint=" << data.fingerprint << '\n';
+    }
+    check(cases[0].sum == cases[1].sum && cases[2].sum == cases[3].sum, "permutation changes affine result");
+    if (!timing) { return; }
+    constexpr std::size_t rounds = 12, repetitions = 3, jobs = 12;
+    constexpr std::array<std::string_view, 3> paths{"affine", "filter_only", "validation_context"};
+    // All four owners remain resident and stationary. Every job occupies every
+    // order position exactly once per run; alternate direction across processes.
+    for (std::size_t warmup = 0; warmup < 2; ++warmup) {
+        for (std::size_t job = 0; job < jobs; ++job) {
+            const auto& data = cases[job % 4]; const auto path = job / 4;
+            const auto expected = path == 0 ? data.sum : path == 1
+                ? static_cast<std::int64_t>(layout_rows / 100 * data.percent) : static_cast<std::int64_t>(layout_rows);
+            const Probe probe;
+            check(layout_query(data, path) == expected, "layout warmup result");
+            check(allocations::calls == 0, "layout warmup query allocated");
+        }
+    }
+    std::cout << "run,round,position,rows,batch,selected,percent,layout,path,repetitions,latency_us,allocations,result,fingerprint\n";
+    std::cout.precision(17);
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t position = 0; position < jobs; ++position) {
+            const auto step = run % 2 == 0 ? position : jobs - 1 - position;
+            const auto job = (round + static_cast<std::size_t>(run) * 3 + step) % jobs;
+            const auto& data = cases[job % 4]; const auto path = job / 4;
+            const auto count = layout_rows / 100 * data.percent;
+            const auto expected = path == 0 ? data.sum : path == 1
+                ? static_cast<std::int64_t>(count) : static_cast<std::int64_t>(layout_rows);
+            std::int64_t checksum = 0;
+            double us;
+            std::size_t allocated;
+            {
+                const Probe probe;
+                const auto start = std::chrono::steady_clock::now();
+                for (std::size_t repeat = 0; repeat < repetitions; ++repeat) { checksum += layout_query(data, path); }
+                const auto finish = std::chrono::steady_clock::now();
+                allocated = allocations::calls;
+                us = std::chrono::duration<double, std::micro>(finish - start).count() / static_cast<double>(repetitions);
+            }
+            check(allocated == 0, "measured layout query allocated");
+            check(checksum == expected * static_cast<std::int64_t>(repetitions), "measured layout result");
+            std::cout << run << ',' << round << ',' << position << ',' << layout_rows << ',' << layout_batch
+                      << ',' << count << ',' << data.percent << ',' << data.layout << ',' << paths[path] << ',' << repetitions
+                      << ',' << us << ',' << allocated << ',' << expected << ',' << data.fingerprint << '\n';
+        }
+    }
+    for (const auto& data : cases) {
+        check(layout_fingerprint(data.columns) == data.fingerprint, "measured dataset changed");
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         calibrate();
+        if (argc == 2 && std::string_view(argv[1]) == "--selectivity-layout-check") { layout_study(false, 0); return 0; }
+        if (argc == 3 && std::string_view(argv[1]) == "--selectivity-layout" &&
+            std::string_view(argv[2]).size() == 1 && argv[2][0] >= '0' && argv[2][0] <= '3') {
+            layout_study(true, static_cast<unsigned>(argv[2][0] - '0')); return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--workload") { workload(); return 0; }
-        check(argc == 1, "use no arguments or --workload");
+        check(argc == 1, "use no arguments, --workload, --selectivity-layout-check, or --selectivity-layout RUN[0..3]");
         known_values_and_types(); public_overflow_and_order(); invalid_inputs(); differential_and_existing_apis();
         std::cout << "Affine SUM: " << checks << " exact batch/differential checks; " << rejected << " expected rejections; "
                   << compatibility << " existing SUM/COUNT comparisons; zero successful query allocations\n";
