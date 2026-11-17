@@ -59,6 +59,7 @@ add_library(vectorforge
     src/data/validated_dataset.cpp
     src/execution/filtered_count.cpp
     src/execution/filtered_sum.cpp
+    src/execution/filtered_affine_sum.cpp
 )
 add_library(VectorForge::vectorforge ALIAS vectorforge)
 target_include_directories(vectorforge
@@ -185,6 +186,17 @@ if(BUILD_TESTING)
         target_compile_options(vectorforge_sum_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
     endif()
     add_test(NAME filtered_sum COMMAND vectorforge_sum_tests)
+
+    add_executable(vectorforge_affine_sum_tests tests/execution/filtered_affine_sum_test.cpp)
+    target_link_libraries(vectorforge_affine_sum_tests PRIVATE VectorForge::vectorforge)
+    target_include_directories(vectorforge_affine_sum_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    set_target_properties(vectorforge_affine_sum_tests PROPERTIES CXX_EXTENSIONS OFF)
+    if(MSVC)
+        target_compile_options(vectorforge_affine_sum_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(vectorforge_affine_sum_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+    endif()
+    add_test(NAME filtered_affine_sum COMMAND vectorforge_affine_sum_tests)
 
     add_executable(vectorforge_candidate_tests tests/execution/candidate_scoring_test.cpp)
     target_link_libraries(vectorforge_candidate_tests PRIVATE VectorForge::vectorforge)
