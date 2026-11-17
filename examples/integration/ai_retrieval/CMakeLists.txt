@@ -29,3 +29,15 @@ endif()
 # Independent exit-status test, even though the embedded library's BUILD_TESTING is OFF.
 enable_testing()
 add_test(NAME ai_retrieval_consumer COMMAND vectorforge_ai_retrieval)
+
+option(VECTORFORGE_BUILD_AI_RETRIEVAL_WORKLOAD "Build the explicit four-cell exactness gate" OFF)
+if(VECTORFORGE_BUILD_AI_RETRIEVAL_WORKLOAD)
+    add_executable(vectorforge_ai_retrieval_workload workload.cpp)
+    target_link_libraries(vectorforge_ai_retrieval_workload PRIVATE VectorForge::vectorforge)
+    if(MSVC)
+        target_compile_options(vectorforge_ai_retrieval_workload PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(vectorforge_ai_retrieval_workload PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+    endif()
+    # Explicit invocation with one cell name; ordinary CTest stays the nine-record check.
+endif()
