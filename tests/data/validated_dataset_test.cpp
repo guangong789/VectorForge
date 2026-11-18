@@ -138,6 +138,9 @@ void move_and_view_lifetimes() {
         expect_throw<std::logic_error>([&] { (void)source.columns(); });
         expect_throw<std::logic_error>([&] { (void)execute_scalar_reference(source, f.query, {}, 0); });
         expect_throw<std::logic_error>([&] { (void)execute_batched(source, f.query, {}, 0, 1); });
+        expect_throw<std::invalid_argument>([&] {
+            (void)execute_batched(source, f.query, {}, 0, 0); // Reject the batch size before accessing the snapshot.
+        });
     }
     check(ids[0] == 42 && ids[4] == 3, "ID view survives source-owner destruction after move");
     check(view->global_row(0) == 1 && view->column<std::int32_t>(0)[0] == 20 && view->embedding_row(0)[2] == 1,
@@ -202,6 +205,17 @@ void query_validation_including_zero_k() {
         reject_query<std::invalid_argument>(dataset, f.query, bad_operator, k);
         const std::array bad_column{Predicate{maximum, Comparison::equal, 1.0F}};
         reject_query<std::out_of_range>(dataset, f.query, bad_column, k);
+        const std::array bad_operator_and_column{Predicate{maximum, bad_operator[0].comparison, 1.0F}};
+        const std::array bad_column_then_operator{bad_column[0], bad_operator[0]};
+        expect_throw<std::invalid_argument>([&] {
+            (void)execute_batched(dataset, short_query, bad_column, k, 2);
+        });
+        expect_throw<std::invalid_argument>([&] {
+            (void)execute_batched(dataset, f.query, bad_operator_and_column, k, 2);
+        });
+        expect_throw<std::out_of_range>([&] {
+            (void)execute_batched(dataset, f.query, bad_column_then_operator, k, 2);
+        });
         const std::array unreachable{Predicate{0, Comparison::greater, std::int32_t{100}}, bad_type[0]};
         reject_query<std::invalid_argument>(dataset, f.query, unreachable, k);
         expect_throw<std::invalid_argument>([&] { (void)execute_batched(dataset, f.query, {}, k, 0); });

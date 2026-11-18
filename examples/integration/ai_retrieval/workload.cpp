@@ -11,6 +11,7 @@
 #include <array>
 #include <bit>
 #include <cfenv>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <concepts>
@@ -476,6 +477,54 @@ void emit_session(const Measurement& m, const Session& observation, std::string_
     }
 }
 
+void profile(const Measurement& m, const Queries& queries, std::size_t fixed_calls) {
+    constexpr std::size_t maximum_calls = 32'768;
+    constexpr Tick target_ns = 2'500'000'000;
+    require(m.cell.rows == 100'000, "profiling is restricted to the two N100K cells");
+    require(fixed_calls <= maximum_calls && fixed_calls % query_count == 0,
+            "profile calls must be a bounded multiple of eight");
+    // Copy only the twenty owning records, never retain full-sort vector capacity.
+    // At most 10 MiB of result payload; every call is checked after the hot loop.
+    std::vector<Top> results(fixed_calls == 0 ? maximum_calls : fixed_calls);
+    std::optional<Inputs> source; source.emplace(construct_inputs(m.cell));
+    require(input_fingerprint(*source) == m.golden.data_hash, "profile dataset fingerprint changed");
+    ValidatedDataset snapshot(source->columns, source->embeddings, source->ids);
+    source.reset();
+    const bool bounded = m.path == "bounded";
+    require(count_where(snapshot, predicates, batch_size) == m.golden.expected.count &&
+            sum_where(snapshot.columns(), tokens_column, predicates, batch_size) == m.golden.expected.tokens,
+            "profile COUNT/SUM differs from independent expectations");
+    for (std::size_t i = 0; i < 2; ++i) {
+        for (std::size_t q = 0; q < query_count; ++q) {
+            const auto result = bounded ? execute_batched(snapshot, queries[q], predicates, top_k, batch_size)
+                                        : execute_scalar_reference(snapshot, queries[q], predicates, top_k);
+            exact(result, m.golden.expected.ranked[q]);
+        }
+    }
+    std::size_t calls = 0;
+    const auto start = now_ns();
+    do {
+        require(calls + query_count <= results.size(), "profile result-storage limit reached");
+        for (std::size_t q = 0; q < query_count; ++q) {
+            const auto result = bounded ? execute_batched(snapshot, queries[q], predicates, top_k, batch_size)
+                                        : execute_scalar_reference(snapshot, queries[q], predicates, top_k);
+            require(result.size() == top_k, "profile result size changed");
+            std::copy(result.begin(), result.end(), results[calls++].begin());
+        } // Result copy/destruction and one clock check per eight calls are included.
+        require(now_ns() - start < 8'000'000'000, "profile interval exceeded its time budget");
+    } while (fixed_calls != 0 ? calls < fixed_calls : now_ns() - start < target_ns);
+    const auto end = now_ns();
+    Fingerprint hash;
+    for (std::size_t i = 0; i < calls; ++i) {
+        exact(results[i], m.golden.expected.ranked[i % query_count]);
+        hash.add(result_fingerprint(results[i]));
+    }
+    common(m, "profile", hash.value);
+    std::cout << ",\"start_ns\":" << start << ",\"end_ns\":" << end << ",\"duration_ns\":" << end - start
+              << ",\"calls\":" << calls << ",\"fixed_calls\":" << fixed_calls
+              << ",\"all_results_exact\":true,\"source_released\":true,\"count_sum_outside_interval\":true}\n";
+}
+
 void timing(const Measurement& m, const Queries& queries) {
     // All logs/results have fixed small storage allocated BEFORE the continuous B..session10 window.
     std::array<Session, 10> initial{}, steady{};
@@ -552,15 +601,24 @@ void memory(const Measurement& m, const Queries& queries) {
 
 int main(int argc, char** argv) {
     try {
-        require(argc >= 2, "usage: workload CELL [--export FILE | --mode timing|memory --path bounded|full-sort --run-id ID --expectations FILE]");
+        require(argc >= 2, "usage: workload CELL [--export FILE | --mode timing|memory|profile --path bounded|full-sort --run-id ID --expectations FILE [--calls N (profile only)]]");
         const auto cell = std::find_if(cells.begin(), cells.end(), [&](const auto& value) { return value.name == argv[1]; });
         if (cell == cells.end()) { throw std::invalid_argument("unknown workload cell"); }
         if (argc == 2) { run(*cell); return 0; }
         if (argc == 4 && std::string_view(argv[2]) == "--export") { run(*cell, argv[3]); return 0; }
-        require(argc == 10 && std::string_view(argv[2]) == "--mode" && std::string_view(argv[4]) == "--path" &&
+        require((argc == 10 || argc == 12) && std::string_view(argv[2]) == "--mode" && std::string_view(argv[4]) == "--path" &&
                 std::string_view(argv[6]) == "--run-id" && std::string_view(argv[8]) == "--expectations", "invalid measurement arguments");
         const std::string_view mode = argv[3], path = argv[5], run_id = argv[7];
-        require((mode == "timing" || mode == "memory") && (path == "bounded" || path == "full-sort"), "invalid measurement mode/path");
+        require((mode == "timing" || mode == "memory" || mode == "profile") &&
+                (path == "bounded" || path == "full-sort"), "invalid measurement mode/path");
+        std::size_t fixed_calls = 0;
+        if (argc == 12) {
+            require(mode == "profile" && std::string_view(argv[10]) == "--calls", "invalid profile call limit");
+            const std::string_view text = argv[11];
+            const auto parsed = std::from_chars(text.data(), text.data() + text.size(), fixed_calls);
+            require(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && fixed_calls > 0,
+                    "invalid profile call count");
+        }
         require(!run_id.empty() && run_id.size() <= 80 && std::all_of(run_id.begin(), run_id.end(), [](char c) {
             return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
         }), "invalid run ID");
@@ -569,7 +627,8 @@ int main(int argc, char** argv) {
         require(query_fingerprint(queries) == golden.query_hash, "measurement query fingerprint changed");
         const NearestEnvironment environment;
         const Measurement measurement{*cell, golden, mode, path, run_id};
-        if (mode == "timing") { timing(measurement, queries); } else { memory(measurement, queries); }
+        if (mode == "profile") { profile(measurement, queries, fixed_calls); }
+        else if (mode == "timing") { timing(measurement, queries); } else { memory(measurement, queries); }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "Workload exactness gate failed: " << error.what() << '\n'; return 1;
