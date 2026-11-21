@@ -63,6 +63,13 @@ struct CandidateTrace {
     std::vector<gpu::RowIndex> rows;
     std::vector<gpu::Score> scores;
 };
+#ifdef VECTORFORGE_V2_MIXED
+struct MixedObservation {
+    std::size_t matched = 0;
+    Tick verify_ns = 0, map_ns = 0, topk_ns = 0;
+    gpu::DevicePhases* events = nullptr;
+};
+#endif
 struct ScoreFailure : std::overflow_error {
     ScoreFailure(std::size_t slot, gpu::RowIndex row, std::uint32_t feature)
         : std::overflow_error("GPU nonfinite score at slot " + std::to_string(slot)
@@ -80,7 +87,11 @@ struct ScoreFailure : std::overflow_error {
 std::vector<ScoredRecord> retrieve_gpu(const ValidatedDataset& snapshot, gpu::ResidentScorer& scorer,
                                       std::span<const float> q, std::span<const Predicate> filters,
                                       std::size_t k, std::size_t batch, Diagnostic* phases = nullptr,
-                                      CandidateTrace* trace = nullptr) {
+                                      CandidateTrace* trace = nullptr
+#ifdef VECTORFORGE_V2_MIXED
+                                      , MixedObservation* mixed = nullptr
+#endif
+                                      ) {
     const auto begin = phases ? now_ns() : 0;
     if (batch == 0) { throw std::invalid_argument("batch size must be positive"); }
     const auto& cols = snapshot.columns();
@@ -124,7 +135,12 @@ std::vector<ScoredRecord> retrieve_gpu(const ValidatedDataset& snapshot, gpu::Re
         phases->row_reserve = reserved - valid;
         phases->scan_emit = now_ns() - reserved;
     }
+#ifdef VECTORFORGE_V2_MIXED
+    if (mixed) { mixed->matched = rows.size(); }
+    auto scores = scorer.score(rows, q, phases ? &phases->scoring : nullptr, mixed ? mixed->events : nullptr);
+#else
     auto scores = scorer.score(rows, q, phases ? &phases->scoring : nullptr);
+#endif
     const auto rank_start = phases ? now_ns() : 0;
     require(scores.size() == rows.size(), "GPU score count changed");
     for (std::size_t slot = 0; slot < scores.size(); ++slot) {
@@ -133,18 +149,34 @@ std::vector<ScoredRecord> retrieve_gpu(const ValidatedDataset& snapshot, gpu::Re
         }
         require(std::isfinite(scores[slot].value), "non-finite successful GPU score");
     }
+#ifdef VECTORFORGE_V2_MIXED
+    const auto verified = phases && mixed ? now_ns() : 0;
+#endif
     std::vector<ScoredRecord> records;
     records.reserve(rows.size());
     for (std::size_t slot = 0; slot < rows.size(); ++slot) {
         records.push_back({ids[rows[slot]], scores[slot].value});
     }
+#ifdef VECTORFORGE_V2_MIXED
+    const auto mapped = phases && mixed ? now_ns() : 0;
+#endif
     const auto limit = std::min(k, records.size());
     std::partial_sort(records.begin(), records.begin() + static_cast<std::ptrdiff_t>(limit), records.end(),
                       [](const auto& a, const auto& b) {
                           return a.score > b.score || (a.score == b.score && a.id < b.id);
                       });
     records.resize(limit);
-    if (phases) { phases->rank = now_ns() - rank_start; }
+    if (phases) {
+        const auto finished = now_ns();
+        phases->rank = finished - rank_start;
+#ifdef VECTORFORGE_V2_MIXED
+        if (mixed) {
+            mixed->verify_ns = verified - rank_start;
+            mixed->map_ns = mapped - verified;
+            mixed->topk_ns = finished - mapped;
+        }
+#endif
+    }
     if (trace) { *trace = {std::move(rows), std::move(scores)}; }
     return records;
 }
