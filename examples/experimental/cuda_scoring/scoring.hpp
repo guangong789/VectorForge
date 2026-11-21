@@ -41,6 +41,13 @@ struct ScorePhases {
     std::uint64_t unpack_ns = 0;
 };
 
+#ifdef VECTORFORGE_V2_LOCALITY
+struct DevicePhases {
+    float h2d_ms = 0, kernel_ms = 0, d2h_ms = 0;
+    std::uint64_t read_ns = 0;
+};
+#endif
+
 // Contract G. Finite float32 operands, +0 start, round-to-nearest FMA in
 // dimension order, gradual underflow and a finite check after every step.
 // Each ordered slot is independent, including duplicates. Host FP flags,
@@ -56,7 +63,15 @@ public:
     ~ResidentScorer();
 
     [[nodiscard]] std::vector<Score> score(std::span<const RowIndex> candidates,
-                                           std::span<const float> query, ScorePhases* phases = nullptr);
+                                           std::span<const float> query, ScorePhases* phases = nullptr
+#ifdef VECTORFORGE_V2_LOCALITY
+                                           , DevicePhases* device = nullptr
+#endif
+                                           );
+#ifdef VECTORFORGE_V2_LOCALITY
+    // Allocate the diagnostic events outside the query interval on this owner.
+    void enable_device_timing();
+#endif
     void close();
 
 private:

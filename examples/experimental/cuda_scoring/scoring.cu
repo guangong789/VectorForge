@@ -26,6 +26,10 @@ constexpr unsigned threads_per_block = 128;
 enum Buffer : std::size_t { embeddings, indices, query, scores, buffer_count };
 constexpr std::array buffer_names{"embeddings", "indices", "query", "scores"};
 
+#ifdef VECTORFORGE_V2_LOCALITY
+enum Marker : std::size_t { h2d_start, h2d_stop, kernel_start, kernel_stop, d2h_start, d2h_stop, marker_count };
+#endif
+
 std::uint64_t time_ns(bool enabled) {
     if (!enabled) { return 0; }
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -86,6 +90,20 @@ struct ResidentScorer::State {
     cudaStream_t stream = nullptr;
     bool usable = false;
     bool verbose = true;
+#ifdef VECTORFORGE_V2_LOCALITY
+    std::array<cudaEvent_t, marker_count> events{};
+
+    void mark(Marker marker) const {
+        check(cudaEventRecord(events[marker], stream), "record device timing event");
+    }
+
+    float elapsed(Marker first, Marker last) const {
+        float ms = 0;
+        check(cudaEventElapsedTime(&ms, events[first], events[last]), "read completed device timing interval");
+        if (!std::isfinite(ms) || ms < 0) { throw std::runtime_error("invalid CUDA event duration"); }
+        return ms;
+    }
+#endif
 
     ~State() noexcept {
         try { close(); }
@@ -135,6 +153,11 @@ struct ResidentScorer::State {
         if (staging) {
             released(cudaFreeHost(std::exchange(staging, nullptr)), "pinned-staging", staging_bytes);
         }
+#ifdef VECTORFORGE_V2_LOCALITY
+        for (auto& event : events) {
+            if (event) { released(cudaEventDestroy(std::exchange(event, nullptr)), "timing event", 0); }
+        }
+#endif
         released(cudaStreamDestroy(std::exchange(stream, nullptr)), "stream", 0);
         check(first_error, "resource cleanup");
     }
@@ -230,8 +253,22 @@ ResidentScorer::ResidentScorer(std::span<const float> row_major, std::size_t row
 
 ResidentScorer::~ResidentScorer() = default;
 
+#ifdef VECTORFORGE_V2_LOCALITY
+void ResidentScorer::enable_device_timing() {
+    auto& s = *state_;
+    if (!s.usable || s.events.front()) { throw std::logic_error("device timing owner is unavailable or already enabled"); }
+    s.usable = false;
+    for (auto& event : s.events) { check(cudaEventCreate(&event), "allocate device timing event"); }
+    s.usable = true;
+}
+#endif
+
 std::vector<Score> ResidentScorer::score(std::span<const RowIndex> candidates,
-                                        std::span<const float> query_values, ScorePhases* phases) {
+                                        std::span<const float> query_values, ScorePhases* phases
+#ifdef VECTORFORGE_V2_LOCALITY
+                                        , DevicePhases* device
+#endif
+                                        ) {
     auto phase_start = time_ns(phases != nullptr);
     const auto finish = [&](std::uint64_t ScorePhases::*field) {
         if (phases) {
@@ -243,6 +280,12 @@ std::vector<Score> ResidentScorer::score(std::span<const RowIndex> candidates,
     if (phases) { *phases = {}; }
     auto& s = *state_;
     if (!s.usable) { throw std::logic_error("scorer is closed or a CUDA operation failed"); }
+#ifdef VECTORFORGE_V2_LOCALITY
+    if (device) {
+        if (!s.events.back()) { throw std::logic_error("device timing is not enabled"); }
+        *device = {};
+    }
+#endif
     if (query_values.size() != s.dimension || !finite(query_values)) {
         throw std::invalid_argument("query must match the embedding dimension and be finite");
     }
@@ -261,17 +304,29 @@ std::vector<Score> ResidentScorer::score(std::span<const RowIndex> candidates,
     std::memcpy(query_stage, query_values.data(), query_values.size_bytes());
     s.usable = false; // A failed submission can leave queued work referencing staging.
     finish(&ScorePhases::prepare_ns);
+#ifdef VECTORFORGE_V2_LOCALITY
+    if (device) { s.mark(h2d_start); }
+#endif
     s.upload(indices, index_stage, candidates.size_bytes());
     s.upload(query, query_stage, query_values.size_bytes());
+#ifdef VECTORFORGE_V2_LOCALITY
+    if (device) { s.mark(h2d_stop); }
+#endif
     finish(&ScorePhases::h2d_submit_ns);
     s.sync("query H2D synchronization");
     finish(&ScorePhases::h2d_wait_ns);
 
     const auto blocks = (candidates.size() - 1) / threads_per_block + 1;
+#ifdef VECTORFORGE_V2_LOCALITY
+    if (device) { s.mark(kernel_start); }
+#endif
     score_rows<<<static_cast<unsigned>(blocks), threads_per_block, 0, s.stream>>>(
         static_cast<const float*>(s.dev[embeddings]), s.dimension, static_cast<const RowIndex*>(s.dev[indices]),
         static_cast<const float*>(s.dev[query]), candidates.size(), static_cast<Score*>(s.dev[scores]));
     check(cudaGetLastError(), "kernel submit");
+#ifdef VECTORFORGE_V2_LOCALITY
+    if (device) { s.mark(kernel_stop); }
+#endif
     finish(&ScorePhases::kernel_submit_ns);
     s.sync("kernel synchronization");
     finish(&ScorePhases::kernel_wait_ns);
@@ -280,12 +335,31 @@ std::vector<Score> ResidentScorer::score(std::span<const RowIndex> candidates,
                     blocks, threads_per_block, candidates.size());
     }
 
+#ifdef VECTORFORGE_V2_LOCALITY
+    if (device) { s.mark(d2h_start); }
+#endif
     check(cudaMemcpyAsync(output_stage, s.dev[scores], output_bytes, cudaMemcpyDeviceToHost, s.stream), "D2H submit");
+#ifdef VECTORFORGE_V2_LOCALITY
+    if (device) { s.mark(d2h_stop); }
+#endif
     if (s.verbose) { std::printf("transfer D2H buffer=scores bytes=%zu\n", output_bytes); }
     finish(&ScorePhases::d2h_submit_ns);
     s.sync("scores D2H synchronization");
     finish(&ScorePhases::d2h_wait_ns);
     std::memcpy(result.data(), output_stage, output_bytes);
+#ifdef VECTORFORGE_V2_LOCALITY
+    // All six markers are complete after the existing D2H stream wait.
+    if (device) {
+        finish(&ScorePhases::unpack_ns);
+        const auto started = time_ns(true);
+        device->h2d_ms = s.elapsed(h2d_start, h2d_stop);
+        device->kernel_ms = s.elapsed(kernel_start, kernel_stop);
+        device->d2h_ms = s.elapsed(d2h_start, d2h_stop);
+        device->read_ns = time_ns(true) - started;
+        s.usable = true;
+        return result;
+    }
+#endif
     s.usable = true;
     finish(&ScorePhases::unpack_ns);
     return result;
