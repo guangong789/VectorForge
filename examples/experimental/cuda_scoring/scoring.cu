@@ -13,6 +13,11 @@
 #include <type_traits>
 #include <utility>
 
+#ifdef VECTORFORGE_V2_PREPARED
+#include <cuda.h>
+#include <thread>
+#endif
+
 namespace cuda_scoring_pilot {
 namespace {
 
@@ -71,6 +76,18 @@ __global__ void score_rows(const float* row_major, std::size_t dimension, const 
     output[slot] = {score, no_failure};
 }
 
+#ifdef VECTORFORGE_V2_PREPARED
+__global__ void gather_rows(const float* source, const RowIndex* candidates, std::size_t dimension,
+                            std::size_t elements, float* compact, RowIndex* compact_indices) {
+    const auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= elements) { return; }
+    const auto slot = i / dimension;
+    const auto feature = i % dimension;
+    compact[i] = source[static_cast<std::size_t>(candidates[slot]) * dimension + feature];
+    if (feature == 0) { compact_indices[slot] = static_cast<RowIndex>(slot); }
+}
+#endif
+
 bool kernel_error(cudaError_t status) {
     return status == cudaErrorLaunchFailure || status == cudaErrorIllegalAddress ||
            status == cudaErrorLaunchTimeout || status == cudaErrorAssert ||
@@ -90,6 +107,32 @@ struct ResidentScorer::State {
     cudaStream_t stream = nullptr;
     bool usable = false;
     bool verbose = true;
+#ifdef VECTORFORGE_V2_PREPARED
+    decltype(&cuCtxGetCurrent) get_context = nullptr;
+    CUcontext context = nullptr;
+    const std::thread::id thread = std::this_thread::get_id();
+    int device = -1;
+    void* compact = nullptr;
+    std::size_t compact_rows = 0, compact_embedding_bytes = 0, compact_bytes = 0;
+    std::size_t device_bytes = 0;
+    bool prepared_once = false;
+    bool prepared_ready = false;
+
+    bool context_matches() const noexcept {
+        CUcontext current = nullptr;
+        int ordinal = -1;
+        return thread == std::this_thread::get_id() && get_context(&current) == CUDA_SUCCESS &&
+               current == context && cudaGetDevice(&ordinal) == cudaSuccess && ordinal == device;
+    }
+
+    void require_context() const {
+        if (!context_matches()) { throw std::logic_error("wrong prepared-study device, context or thread"); }
+    }
+
+    RowIndex* compact_indices() const {
+        return reinterpret_cast<RowIndex*>(static_cast<std::byte*>(compact) + compact_embedding_bytes);
+    }
+#endif
 #ifdef VECTORFORGE_V2_LOCALITY
     std::array<cudaEvent_t, marker_count> events{};
 
@@ -125,9 +168,14 @@ struct ResidentScorer::State {
         if (verbose) { std::printf("transfer H2D buffer=%s bytes=%zu\n", buffer_names[buffer], count); }
     }
 
-    void close() {
-        if (stream == nullptr) { return; }
-        usable = false;
+    void drain() const {
+#ifdef VECTORFORGE_V2_PREPARED
+        if (!context_matches()) {
+            std::fputs("prepared cleanup context unconfirmed\n", stderr);
+            std::fflush(nullptr);
+            std::_Exit(74);
+        }
+#endif
         const auto drained = cudaStreamSynchronize(stream);
         if (drained != cudaSuccess) {
             // No host/device buffer is freed while its stream may still reference
@@ -137,6 +185,12 @@ struct ResidentScorer::State {
             std::fflush(nullptr);
             std::_Exit(74);
         }
+    }
+
+    void close() {
+        if (stream == nullptr) { return; }
+        usable = false;
+        drain();
         auto first_error = cudaSuccess;
         const auto released = [&](cudaError_t status, const char* name, std::size_t size) {
             if (verbose || status != cudaSuccess) {
@@ -144,6 +198,10 @@ struct ResidentScorer::State {
             }
             if (first_error == cudaSuccess) { first_error = status; }
         };
+#ifdef VECTORFORGE_V2_PREPARED
+        prepared_ready = false;
+        if (compact) { released(cudaFree(std::exchange(compact, nullptr)), "prepared candidates", compact_bytes); }
+#endif
         for (std::size_t i = dev.size(); i > 0; --i) {
             const auto index = i - 1;
             if (dev[index]) {
@@ -219,6 +277,20 @@ ResidentScorer::ResidentScorer(std::span<const float> row_major, std::size_t row
         throw std::runtime_error("insufficient free GPU memory for pilot");
     }
 
+#ifdef VECTORFORGE_V2_PREPARED
+    s.device_bytes = requested;
+    void* entry = nullptr;
+    cudaDriverEntryPointQueryResult status{};
+    check(cudaGetDriverEntryPoint("cuCtxGetCurrent", &entry, cudaEnableDefault, &status), "query context entry");
+    if (status != cudaDriverEntryPointSuccess || entry == nullptr) {
+        throw std::runtime_error("CUDA context identity unavailable");
+    }
+    s.get_context = reinterpret_cast<decltype(s.get_context)>(entry);
+    if (s.get_context(&s.context) != CUDA_SUCCESS || s.context == nullptr) {
+        throw std::runtime_error("owning CUDA context unavailable");
+    }
+    check(cudaGetDevice(&s.device), "identify owning CUDA device");
+#endif
     check(cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking), "create private stream");
     for (std::size_t i = 0; i < s.dev.size(); ++i) {
         if (s.bytes[i] == 0) { continue; }
@@ -257,18 +329,140 @@ ResidentScorer::~ResidentScorer() = default;
 void ResidentScorer::enable_device_timing() {
     auto& s = *state_;
     if (!s.usable || s.events.front()) { throw std::logic_error("device timing owner is unavailable or already enabled"); }
+#ifdef VECTORFORGE_V2_PREPARED
+    s.require_context();
+#endif
     s.usable = false;
     for (auto& event : s.events) { check(cudaEventCreate(&event), "allocate device timing event"); }
     s.usable = true;
 }
 #endif
 
+#ifdef VECTORFORGE_V2_PREPARED
+void ResidentScorer::prepare_candidates(std::span<const RowIndex> candidates, PreparationPhases& phases) {
+    phases = {};
+    auto& s = *state_;
+    const auto begin = time_ns(true);
+    if (!s.usable || s.prepared_once || !s.events.back()) {
+        throw std::logic_error("prepared owner unavailable, already bound, or missing timing events");
+    }
+    s.require_context();
+    if (candidates.size() > s.capacity) { throw std::invalid_argument("candidate capacity exceeded"); }
+    for (const auto row : candidates) {
+        if (row >= s.rows) { throw std::out_of_range("candidate row is out of range"); }
+    }
+    const auto elements = multiply(candidates.size(), s.dimension);
+    const auto payload = multiply(elements, sizeof(float));
+    const auto index_bytes = candidates.size_bytes();
+    if (payload > device_limit - s.device_bytes || index_bytes > device_limit - s.device_bytes - payload) {
+        throw std::length_error("aggregate prepared device allocation budget exceeded");
+    }
+    const auto additional = payload + index_bytes;
+    if (additional != 0) {
+        std::size_t total = 0;
+        check(cudaMemGetInfo(&phases.free_device_bytes, &total), "device memory query before preparation");
+        if (phases.free_device_bytes < free_memory_floor || phases.free_device_bytes < additional) {
+            throw std::runtime_error("insufficient free GPU memory for preparation");
+        }
+    }
+    phases.validation_ns = time_ns(true) - begin;
+    s.prepared_once = true;
+    s.compact_rows = candidates.size();
+    s.compact_embedding_bytes = payload;
+    s.compact_bytes = additional;
+    if (additional != 0) {
+        s.usable = false;
+        auto start = time_ns(true);
+        check(cudaMalloc(&s.compact, additional), "allocate prepared candidates");
+        phases.additional_device_bytes = additional;
+        phases.allocation_ns = time_ns(true) - start;
+        start = time_ns(true);
+        std::memcpy(s.staging, candidates.data(), index_bytes);
+        phases.staging_ns = time_ns(true) - start;
+        start = time_ns(true);
+        s.mark(h2d_start);
+        s.upload(indices, s.staging, index_bytes);
+        s.mark(h2d_stop);
+        phases.h2d_submit_ns = time_ns(true) - start;
+        start = time_ns(true);
+        s.sync("prepared index synchronization");
+        phases.h2d_wait_ns = time_ns(true) - start;
+        const auto blocks = (elements - 1) / threads_per_block + 1;
+        start = time_ns(true);
+        s.mark(kernel_start);
+        gather_rows<<<static_cast<unsigned>(blocks), threads_per_block, 0, s.stream>>>(
+            static_cast<const float*>(s.dev[embeddings]), static_cast<const RowIndex*>(s.dev[indices]),
+            s.dimension, elements, static_cast<float*>(s.compact), s.compact_indices());
+        check(cudaGetLastError(), "prepared gather submit");
+        s.mark(kernel_stop);
+        phases.gather_submit_ns = time_ns(true) - start;
+        start = time_ns(true);
+        s.sync("prepared gather synchronization");
+        phases.gather_wait_ns = time_ns(true) - start;
+        start = time_ns(true);
+        phases.h2d_ms = s.elapsed(h2d_start, h2d_stop);
+        phases.gather_ms = s.elapsed(kernel_start, kernel_stop);
+        phases.event_read_ns = time_ns(true) - start;
+        s.usable = true;
+    }
+    s.prepared_ready = true;
+}
+
+std::vector<float> ResidentScorer::read_prepared_for_check() {
+    auto& s = *state_;
+    if (!s.usable || !s.prepared_ready) { throw std::logic_error("prepared candidates unavailable"); }
+    s.require_context();
+    std::vector<float> values(s.compact_embedding_bytes / sizeof(float));
+    if (values.empty()) { return values; }
+    s.usable = false;
+    const auto* source = static_cast<const std::byte*>(s.compact);
+    auto destination = std::as_writable_bytes(std::span(values));
+    for (std::size_t offset = 0; offset < destination.size();) {
+        const auto count = std::min(s.staging_bytes, destination.size() - offset);
+        check(cudaMemcpyAsync(s.staging, source + offset, count, cudaMemcpyDeviceToHost, s.stream),
+              "verify prepared embeddings D2H submit");
+        s.sync("verify prepared embeddings synchronization");
+        std::memcpy(destination.data() + offset, s.staging, count);
+        offset += count;
+    }
+    s.usable = true;
+    return values;
+}
+
+void ResidentScorer::release_prepared() {
+    auto& s = *state_;
+    if (!s.prepared_ready) { return; }
+    if (!s.usable) { throw std::logic_error("failed prepared owner requires full cleanup"); }
+    s.prepared_ready = false;
+    if (s.compact == nullptr) { return; }
+    s.usable = false;
+    s.drain();
+    check(cudaFree(s.compact), "release prepared candidates");
+    s.compact = nullptr;
+    s.usable = true;
+}
+
+std::vector<Score> ResidentScorer::score(std::span<const RowIndex> candidates, std::span<const float> query_values,
+                                        ScorePhases* phases, DevicePhases* device) {
+    return score_impl(candidates, query_values, phases, device, false);
+}
+
+std::vector<Score> ResidentScorer::score_prepared(std::span<const float> query_values, ScorePhases* phases,
+                                                 DevicePhases* device) {
+    return score_impl({}, query_values, phases, device, true);
+}
+
+std::vector<Score> ResidentScorer::score_impl(std::span<const RowIndex> candidates,
+                                             std::span<const float> query_values, ScorePhases* phases,
+                                             DevicePhases* device, bool prepared) {
+#else
 std::vector<Score> ResidentScorer::score(std::span<const RowIndex> candidates,
                                         std::span<const float> query_values, ScorePhases* phases
 #ifdef VECTORFORGE_V2_LOCALITY
                                         , DevicePhases* device
 #endif
                                         ) {
+#endif
     auto phase_start = time_ns(phases != nullptr);
     const auto finish = [&](std::uint64_t ScorePhases::*field) {
         if (phases) {
@@ -280,6 +474,13 @@ std::vector<Score> ResidentScorer::score(std::span<const RowIndex> candidates,
     if (phases) { *phases = {}; }
     auto& s = *state_;
     if (!s.usable) { throw std::logic_error("scorer is closed or a CUDA operation failed"); }
+#ifdef VECTORFORGE_V2_PREPARED
+    s.require_context();
+    if (prepared && !s.prepared_ready) { throw std::logic_error("prepared candidates unavailable"); }
+    const auto count = prepared ? s.compact_rows : candidates.size();
+#else
+    const auto count = candidates.size();
+#endif
 #ifdef VECTORFORGE_V2_LOCALITY
     if (device) {
         if (!s.events.back()) { throw std::logic_error("device timing is not enabled"); }
@@ -293,21 +494,21 @@ std::vector<Score> ResidentScorer::score(std::span<const RowIndex> candidates,
     for (const auto row : candidates) {
         if (row >= s.rows) { throw std::out_of_range("candidate row is out of range"); }
     }
-    if (candidates.empty()) { finish(&ScorePhases::prepare_ns); return {}; }
+    if (count == 0) { finish(&ScorePhases::prepare_ns); return {}; }
 
-    std::vector<Score> result(candidates.size());
+    std::vector<Score> result(count);
     auto* index_stage = static_cast<std::byte*>(s.staging);
     auto* query_stage = index_stage + s.bytes[indices];
     auto* output_stage = query_stage + s.bytes[query];
     const auto output_bytes = multiply(result.size(), sizeof(Score));
-    std::memcpy(index_stage, candidates.data(), candidates.size_bytes());
+    if (!candidates.empty()) { std::memcpy(index_stage, candidates.data(), candidates.size_bytes()); }
     std::memcpy(query_stage, query_values.data(), query_values.size_bytes());
     s.usable = false; // A failed submission can leave queued work referencing staging.
     finish(&ScorePhases::prepare_ns);
 #ifdef VECTORFORGE_V2_LOCALITY
     if (device) { s.mark(h2d_start); }
 #endif
-    s.upload(indices, index_stage, candidates.size_bytes());
+    if (!candidates.empty()) { s.upload(indices, index_stage, candidates.size_bytes()); }
     s.upload(query, query_stage, query_values.size_bytes());
 #ifdef VECTORFORGE_V2_LOCALITY
     if (device) { s.mark(h2d_stop); }
@@ -316,13 +517,21 @@ std::vector<Score> ResidentScorer::score(std::span<const RowIndex> candidates,
     s.sync("query H2D synchronization");
     finish(&ScorePhases::h2d_wait_ns);
 
-    const auto blocks = (candidates.size() - 1) / threads_per_block + 1;
+    const auto blocks = (count - 1) / threads_per_block + 1;
+    const auto* rows = static_cast<const float*>(s.dev[embeddings]);
+    const auto* candidate_indices = static_cast<const RowIndex*>(s.dev[indices]);
+#ifdef VECTORFORGE_V2_PREPARED
+    if (prepared) {
+        rows = static_cast<const float*>(s.compact);
+        candidate_indices = s.compact_indices();
+    }
+#endif
 #ifdef VECTORFORGE_V2_LOCALITY
     if (device) { s.mark(kernel_start); }
 #endif
     score_rows<<<static_cast<unsigned>(blocks), threads_per_block, 0, s.stream>>>(
-        static_cast<const float*>(s.dev[embeddings]), s.dimension, static_cast<const RowIndex*>(s.dev[indices]),
-        static_cast<const float*>(s.dev[query]), candidates.size(), static_cast<Score*>(s.dev[scores]));
+        rows, s.dimension, candidate_indices, static_cast<const float*>(s.dev[query]),
+        count, static_cast<Score*>(s.dev[scores]));
     check(cudaGetLastError(), "kernel submit");
 #ifdef VECTORFORGE_V2_LOCALITY
     if (device) { s.mark(kernel_stop); }
@@ -332,7 +541,7 @@ std::vector<Score> ResidentScorer::score(std::span<const RowIndex> candidates,
     finish(&ScorePhases::kernel_wait_ns);
     if (s.verbose) {
         std::printf("kernel status=completed blocks=%zu threads=%u candidates=%zu\n",
-                    blocks, threads_per_block, candidates.size());
+                    blocks, threads_per_block, count);
     }
 
 #ifdef VECTORFORGE_V2_LOCALITY

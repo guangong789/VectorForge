@@ -165,6 +165,7 @@ void identity(const StudyFixture& f, std::string_view layout) {
     std::cout << "]}\n";
 }
 
+#ifndef VECTORFORGE_PRIVATE_LOCALITY_REUSE
 // The same immutable snapshot supplies both the staging upload and retrieval.
 class LocalResident {
 public:
@@ -362,9 +363,11 @@ void run_trial(const StudyFixture& f, Trial trial, std::string_view mode, Tick d
     }
     for (std::size_t j = 0; j < query_count; ++j) { emit_sample(j, samples[j]); }
 }
+#endif
 
 } // namespace
 
+#ifndef VECTORFORGE_PRIVATE_LOCALITY_REUSE
 int main(int argc, char** argv) {
     try {
         require(argc == 3, "usage: vectorforge_cuda_locality MODE clustered|scattered");
@@ -397,3 +400,4 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
+#endif

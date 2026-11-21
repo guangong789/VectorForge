@@ -48,6 +48,16 @@ struct DevicePhases {
 };
 #endif
 
+#ifdef VECTORFORGE_V2_PREPARED
+struct PreparationPhases {
+    std::uint64_t validation_ns = 0, allocation_ns = 0, staging_ns = 0;
+    std::uint64_t h2d_submit_ns = 0, h2d_wait_ns = 0, gather_submit_ns = 0, gather_wait_ns = 0;
+    float h2d_ms = 0, gather_ms = 0;
+    std::uint64_t event_read_ns = 0;
+    std::size_t free_device_bytes = 0, additional_device_bytes = 0;
+};
+#endif
+
 // Contract G. Finite float32 operands, +0 start, round-to-nearest FMA in
 // dimension order, gradual underflow and a finite check after every step.
 // Each ordered slot is independent, including duplicates. Host FP flags,
@@ -72,9 +82,21 @@ public:
     // Allocate the diagnostic events outside the query interval on this owner.
     void enable_device_timing();
 #endif
+#ifdef VECTORFORGE_V2_PREPARED
+    // A single candidate sequence per owner. All work uses the original private stream.
+    void prepare_candidates(std::span<const RowIndex> candidates, PreparationPhases& phases);
+    [[nodiscard]] std::vector<Score> score_prepared(std::span<const float> query, ScorePhases* phases = nullptr,
+                                                    DevicePhases* device = nullptr);
+    [[nodiscard]] std::vector<float> read_prepared_for_check();
+    void release_prepared();
+#endif
     void close();
 
 private:
+#ifdef VECTORFORGE_V2_PREPARED
+    [[nodiscard]] std::vector<Score> score_impl(std::span<const RowIndex> candidates, std::span<const float> query,
+                                               ScorePhases* phases, DevicePhases* device, bool prepared);
+#endif
     struct State;
     std::unique_ptr<State> state_;
 };
